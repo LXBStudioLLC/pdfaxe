@@ -6,8 +6,11 @@
 //! - Simple single-byte fonts (Type1/TrueType with WinAnsi/Standard encodings
 //!   or a ToUnicode CMap) are editable. Composite (Type0/CID) fonts are
 //!   displayed but marked non-editable unless their ToUnicode map inverts.
-//! - Same font, same position, no reflow: replacement text flows naturally
-//!   within its show-operator, but large length changes can overlap neighbors.
+//! - Same font, same baseline: an edit keeps the run's start position. When
+//!   the font's glyph widths are known (/Widths or a standard-14 face), the
+//!   rest of the line shifts to fit the new width and the shift is undone at
+//!   the next line break — same-line reflow. Paragraph re-wrap (moving words
+//!   across lines) is not attempted yet.
 //! - Positions are the text-matrix origin at the start of each show op;
 //!   within-line advances are not simulated yet (good enough for hitboxes).
 
@@ -18,6 +21,7 @@ use anyhow::{anyhow, Result};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
+use crate::metrics::{advance, page_font_widths, tj_number_advance, AdvanceState, GlyphWidths};
 use crate::ops::resolve_inherited;
 
 /// One show-text operation (or one string element inside a TJ array).
@@ -643,8 +647,12 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
     Ok(runs)
 }
 
-/// Replace the text of one run in place (same font, same position) and patch
-/// the page's content stream.
+/// Replace the text of one run (same font, same start position) and patch the
+/// page's content stream. When the font's glyph widths are known and the edit
+/// changes the run's width, the rest of the line is shifted to fit and the
+/// shift is undone at the next line break (same-line reflow); otherwise the
+/// edit degrades to a pure in-place patch. Content-stream op indices may
+/// change — re-list runs after every edit.
 pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str) -> Result<()> {
     let pages = doc.get_pages();
     let &page_id = pages.get(&page_no).ok_or_else(|| anyhow!("page {page_no} out of range"))?;
@@ -658,6 +666,7 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
              appear in the document (full font re-embedding is on the roadmap)"
         )
     })?;
+    let widths = page_font_widths(doc, page_id);
 
     let content_bytes = doc.get_page_content(page_id);
     let mut content = Content::decode(&content_bytes).map_err(|e| anyhow!("couldn't parse page content: {e}"))?;
@@ -674,17 +683,192 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
             _ => None,
         },
     };
-    match target {
-        Some(Object::String(bytes, _format)) => {
-            *bytes = new_bytes;
-        }
+    let old_bytes = match target {
+        Some(Object::String(bytes, _format)) => std::mem::replace(bytes, new_bytes.clone()),
         _ => return Err(anyhow!("run no longer matches the content stream — reload the page")),
-    }
+    };
+
+    reflow_line(&mut content.operations, run.op_index, run.tj_item, &old_bytes, &new_bytes, &widths);
 
     let encoded = content.encode().map_err(|e| anyhow!("couldn't re-encode page content: {e}"))?;
     doc.change_page_content(page_id, encoded)
         .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
     Ok(())
+}
+
+/// After an in-place string edit changed a run's advance, shift what remains
+/// of its line so neighbors don't overlap, and cancel the shift at the next
+/// line break so following lines stay put.
+///
+/// Positioning model: `Td`/`TD` translate the line matrix, so patching one
+/// shifts everything after it in the block — hence the compensating `-delta`
+/// on the first op that leaves the baseline (or an inserted `Td` before
+/// operand-less breaks like `T*`). Strings later in the same `TJ` array flow
+/// from the new width automatically and need no patch.
+///
+/// Best-effort by design: bails without touching anything when widths are
+/// unknown or a rotated/scaled text matrix is involved.
+fn reflow_line(
+    ops: &mut Vec<Operation>,
+    edit_op: usize,
+    edit_tj: Option<usize>,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+    widths: &HashMap<String, GlyphWidths>,
+) {
+    const EPS: f32 = 0.05;
+    let opnum = |op: &Operation, i: usize| op.operands.get(i).and_then(num).unwrap_or(0.0);
+
+    // Pass 1: reconstruct text state and the edit point's baseline position.
+    let mut font_res = String::new();
+    let mut st = AdvanceState::default();
+    let mut tlm = (0.0f32, 0.0f32);
+    let mut leading = 0.0f32;
+    let mut pure = true; // no rotated/scaled Tm in the current BT block
+    let mut edit_pos = None;
+
+    for (i, op) in ops.iter().enumerate() {
+        match op.operator.as_str() {
+            "BT" => {
+                tlm = (0.0, 0.0);
+                pure = true;
+            }
+            "Tf" => {
+                if let Some(Object::Name(n)) = op.operands.first() {
+                    font_res = String::from_utf8_lossy(n).into_owned();
+                }
+                if let Some(sz) = op.operands.get(1).and_then(num) {
+                    st.font_size = sz;
+                }
+            }
+            "Tc" => st.char_spacing = opnum(op, 0),
+            "Tw" => st.word_spacing = opnum(op, 0),
+            "Tz" => st.h_scale = opnum(op, 0),
+            "TL" => leading = opnum(op, 0),
+            "Tm" => {
+                if op.operands.len() == 6 {
+                    let (a, b, c, d) = (opnum(op, 0), opnum(op, 1), opnum(op, 2), opnum(op, 3));
+                    if (a - 1.0).abs() > EPS || b.abs() > EPS || c.abs() > EPS || (d - 1.0).abs() > EPS {
+                        pure = false;
+                    }
+                    tlm = (opnum(op, 4), opnum(op, 5));
+                }
+            }
+            "Td" | "TD" => {
+                let (tx, ty) = (opnum(op, 0), opnum(op, 1));
+                if op.operator == "TD" {
+                    leading = -ty;
+                }
+                tlm = (tlm.0 + tx, tlm.1 + ty);
+            }
+            "T*" | "'" => tlm.1 -= leading,
+            "\"" => {
+                st.word_spacing = opnum(op, 0);
+                st.char_spacing = opnum(op, 1);
+                tlm.1 -= leading;
+            }
+            _ => {}
+        }
+        if i == edit_op {
+            let mut x = tlm.0;
+            if let Some(k) = edit_tj {
+                // Advance across the TJ items before the edited one.
+                let Some(gw) = widths.get(&font_res) else { return };
+                let Some(Object::Array(items)) = op.operands.first() else { return };
+                for item in items.iter().take(k) {
+                    match item {
+                        Object::String(bytes, _) => match advance(gw, bytes, &st) {
+                            Some(a) => x += a,
+                            None => return,
+                        },
+                        other => {
+                            if let Some(n) = num(other) {
+                                x += tj_number_advance(n, &st);
+                            }
+                        }
+                    }
+                }
+            }
+            edit_pos = Some((x, tlm.1));
+            break;
+        }
+    }
+
+    let Some((x_e, y_e)) = edit_pos else { return };
+    if !pure {
+        return;
+    }
+    let Some(gw) = widths.get(&font_res) else { return };
+    let (Some(old_adv), Some(new_adv)) = (advance(gw, old_bytes, &st), advance(gw, new_bytes, &st))
+    else {
+        return;
+    };
+    let delta = new_adv - old_adv;
+    if delta.abs() < 0.005 {
+        return;
+    }
+
+    // Pass 2: walk the rest of the block, shifting same-line positioning ops
+    // and cancelling the shift at the first op that leaves the baseline.
+    let mut shift_active = false;
+    let mut inserts: Vec<(usize, Operation)> = Vec::new();
+
+    for i in (edit_op + 1)..ops.len() {
+        match ops[i].operator.clone().as_str() {
+            "BT" | "ET" => break,
+            "TL" => leading = opnum(&ops[i], 0),
+            "Tm" => {
+                if ops[i].operands.len() != 6 {
+                    break;
+                }
+                let (a, b, c, d) = (opnum(&ops[i], 0), opnum(&ops[i], 1), opnum(&ops[i], 2), opnum(&ops[i], 3));
+                if (a - 1.0).abs() > EPS || b.abs() > EPS || c.abs() > EPS || (d - 1.0).abs() > EPS {
+                    // Rotated/scaled reset: absolute, so nothing to undo — stop.
+                    break;
+                }
+                let (e, f) = (opnum(&ops[i], 4), opnum(&ops[i], 5));
+                tlm = (e, f);
+                if (f - y_e).abs() < EPS && e >= x_e - EPS {
+                    ops[i].operands[4] = (e + delta).into();
+                    shift_active = true;
+                } else {
+                    shift_active = false;
+                }
+            }
+            "Td" | "TD" => {
+                let (tx, ty) = (opnum(&ops[i], 0), opnum(&ops[i], 1));
+                if ops[i].operator == "TD" {
+                    leading = -ty;
+                }
+                let land = (tlm.0 + tx, tlm.1 + ty);
+                if shift_active {
+                    if (land.1 - y_e).abs() > EPS && !ops[i].operands.is_empty() {
+                        ops[i].operands[0] = (tx - delta).into();
+                        shift_active = false;
+                    }
+                } else if (land.1 - y_e).abs() < EPS && land.0 >= x_e - EPS && !ops[i].operands.is_empty() {
+                    ops[i].operands[0] = (tx + delta).into();
+                    shift_active = true;
+                }
+                tlm = land;
+            }
+            "T*" | "'" | "\"" => {
+                let land = (tlm.0, tlm.1 - leading);
+                if shift_active && (land.1 - y_e).abs() > EPS {
+                    inserts.push((i, Operation::new("Td", vec![(-delta).into(), 0.0f32.into()])));
+                    shift_active = false;
+                } else if !shift_active && (land.1 - y_e).abs() < EPS && land.0 >= x_e - EPS {
+                    inserts.push((i, Operation::new("Td", vec![delta.into(), 0.0f32.into()])));
+                    shift_active = true;
+                }
+                tlm = land;
+            }
+            _ => {}
+        }
+    }
+    for (idx, op) in inserts.into_iter().rev() {
+        ops.insert(idx, op);
+    }
 }
 
 /// Find & replace across a page's editable runs. Returns replacement count.
@@ -847,5 +1031,104 @@ mod tests {
         let doc = one_page_doc(font, b"BT /F1 12 Tf 50 700 Td (Hi) Tj ET");
         let runs = text_runs(&doc, 1).unwrap();
         assert!(!runs[0].editable, "symbolic fonts must refuse edits");
+    }
+
+    fn helv() -> Dictionary {
+        use lopdf::dictionary;
+        dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        }
+    }
+
+    /// Width of `text` in Helvetica at `size`, via the same metrics tables.
+    fn helv_w(text: &str, size: f32) -> f32 {
+        let gw = crate::metrics::std14_widths(b"Helvetica").unwrap();
+        let st = crate::metrics::AdvanceState { font_size: size, ..Default::default() };
+        crate::metrics::advance(&gw, text.as_bytes(), &st).unwrap()
+    }
+
+    #[test]
+    fn reflow_shifts_rest_of_line_and_spares_next_line() {
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td (AB) Tj 60 0 Td (CD) Tj 0 -20 Td (EF) Tj ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!((runs[1].x - 110.0).abs() < 0.01);
+
+        edit_run(&mut doc, 1, &runs[0], "ABAB").unwrap();
+        let delta = helv_w("ABAB", 12.0) - helv_w("AB", 12.0);
+        assert!(delta > 1.0);
+
+        let after = text_runs(&doc, 1).unwrap();
+        let cd = after.iter().find(|r| r.text == "CD").unwrap();
+        let ef = after.iter().find(|r| r.text == "EF").unwrap();
+        assert!((cd.x - (110.0 + delta)).abs() < 0.01, "CD must shift by {delta}, got x={}", cd.x);
+        assert!((cd.y - 700.0).abs() < 0.01);
+        assert!((ef.x - 110.0).abs() < 0.01, "next line must not shift, got x={}", ef.x);
+        assert!((ef.y - 680.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn reflow_shrink_pulls_line_left() {
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td (AB) Tj 60 0 Td (CD) Tj 30 0 Td (EF) Tj ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        edit_run(&mut doc, 1, &runs[0], "A").unwrap();
+        let delta = helv_w("A", 12.0) - helv_w("AB", 12.0);
+        assert!(delta < -1.0);
+
+        let after = text_runs(&doc, 1).unwrap();
+        assert!((after[1].x - (110.0 + delta)).abs() < 0.01, "got x={}", after[1].x);
+        // EF flows with the same line's shift (relative Td chain).
+        assert!((after[2].x - (140.0 + delta)).abs() < 0.01, "got x={}", after[2].x);
+    }
+
+    #[test]
+    fn reflow_tj_edit_shifts_following_td() {
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td [(AB) -100 (CD)] TJ 200 0 Td (EF) Tj ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs[1].text, "CD");
+
+        edit_run(&mut doc, 1, &runs[1], "CDCD").unwrap();
+        let delta = helv_w("CDCD", 12.0) - helv_w("CD", 12.0);
+
+        let after = text_runs(&doc, 1).unwrap();
+        let ef = after.iter().find(|r| r.text == "EF").unwrap();
+        assert!((ef.x - (250.0 + delta)).abs() < 0.01, "got x={}", ef.x);
+    }
+
+    #[test]
+    fn reflow_tm_same_line_shifts_only_that_tm() {
+        let content: &[u8] = b"BT /F1 12 Tf 1 0 0 1 50 700 Tm (AB) Tj \
+                               1 0 0 1 120 700 Tm (CD) Tj 1 0 0 1 50 680 Tm (EF) Tj ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        edit_run(&mut doc, 1, &runs[0], "ABAB").unwrap();
+        let delta = helv_w("ABAB", 12.0) - helv_w("AB", 12.0);
+
+        let after = text_runs(&doc, 1).unwrap();
+        let cd = after.iter().find(|r| r.text == "CD").unwrap();
+        let ef = after.iter().find(|r| r.text == "EF").unwrap();
+        assert!((cd.x - (120.0 + delta)).abs() < 0.01, "got x={}", cd.x);
+        assert!((ef.x - 50.0).abs() < 0.01 && (ef.y - 680.0).abs() < 0.01, "absolute Tm lines must stay put");
+    }
+
+    #[test]
+    fn reflow_skips_unmeasurable_fonts() {
+        use lopdf::dictionary;
+        let font = dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "MysteryFont",
+            "Encoding" => "WinAnsiEncoding",
+        };
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td (AB) Tj 60 0 Td (CD) Tj ET";
+        let mut doc = one_page_doc(font, content);
+        let runs = text_runs(&doc, 1).unwrap();
+        edit_run(&mut doc, 1, &runs[0], "ABAB").unwrap();
+
+        let after = text_runs(&doc, 1).unwrap();
+        assert_eq!(after[0].text, "ABAB", "edit itself must still land");
+        assert!((after[1].x - 110.0).abs() < 0.01, "no metrics -> no shift, got x={}", after[1].x);
     }
 }

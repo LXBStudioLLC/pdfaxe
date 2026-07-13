@@ -166,9 +166,13 @@ fn page_media_box(doc: &Document, page_id: ObjectId) -> (f32, f32, f32, f32) {
     }
 }
 
-/// Rough Helvetica line width — good enough for centering.
+/// Helvetica line width from the built-in standard-14 metrics.
 fn approx_width(text: &str, size: f32) -> f32 {
-    text.chars().count() as f32 * size * 0.5
+    use crate::metrics::{advance, std14_widths, AdvanceState};
+    let st = AdvanceState { font_size: size, ..Default::default() };
+    std14_widths(b"Helvetica")
+        .and_then(|gw| advance(&gw, &winansi_bytes(text), &st))
+        .unwrap_or_else(|| text.chars().count() as f32 * size * 0.5)
 }
 
 fn winansi_bytes(text: &str) -> Vec<u8> {
