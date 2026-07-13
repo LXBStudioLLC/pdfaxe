@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pdfaxe_core::ops::all_pages;
 use pdfaxe_core::{
-    assemble, extract_text, info, load, page_numbers, parse_ranges, redact_page, rotate_pages,
-    save, watermark, PageSel, RedactRect, StampOpts,
+    assemble, extract_text, images_to_pdf, info, load, page_numbers, parse_ranges, redact_page,
+    rotate_pages, save, watermark, PageSel, RedactRect, StampOpts,
 };
 
 #[derive(Parser)]
@@ -52,15 +52,26 @@ enum Command {
         #[arg(short, long, default_value_t = 1)]
         page: u32,
     },
-    /// Render one page to a PNG (pure-Rust rasterizer)
+    /// Render one page — or a range of pages — to PNG (pure-Rust rasterizer)
     Render {
         input: PathBuf,
+        /// Output file; with --pages it becomes a pattern (out.png -> out-3.png)
         #[arg(short, long)]
         out: PathBuf,
         #[arg(short, long, default_value_t = 1)]
         page: u32,
+        /// Multiple pages, e.g. "1-3,5" or "1-" (overrides --page)
+        #[arg(long)]
+        pages: Option<String>,
         #[arg(short, long, default_value_t = 1200)]
         width: u32,
+    },
+    /// Build a PDF from images — one page per image (JPEG kept lossless)
+    Images {
+        #[arg(short, long)]
+        out: PathBuf,
+        /// PNG or JPEG files, in page order
+        inputs: Vec<PathBuf>,
     },
     /// List the text runs of a page (font, size, position, editability)
     Runs {
@@ -182,11 +193,34 @@ fn main() -> Result<()> {
             let doc = load(&input)?;
             println!("{}", extract_text(&doc, page)?);
         }
-        Command::Render { input, out, page, width } => {
+        Command::Render { input, out, page, pages, width } => {
             let bytes = std::fs::read(&input)?;
-            let png = pdfaxe_core::render::render_page_png(&bytes, page, width)?;
-            std::fs::write(&out, png)?;
-            println!("rendered page {page} at {width}px -> {}", out.display());
+            match pages {
+                None => {
+                    let png = pdfaxe_core::render::render_page_png(&bytes, page, width)?;
+                    std::fs::write(&out, png)?;
+                    println!("rendered page {page} at {width}px -> {}", out.display());
+                }
+                Some(expr) => {
+                    let count = info(&load(&input)?).pages;
+                    let selected = parse_ranges(&expr, count)?;
+                    let stem = out.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".into());
+                    let dir = out.parent().map(PathBuf::from).unwrap_or_default();
+                    for &p in &selected {
+                        let png = pdfaxe_core::render::render_page_png(&bytes, p, width)?;
+                        let file = dir.join(format!("{stem}-{p}.png"));
+                        std::fs::write(&file, png)?;
+                        println!("rendered page {p} -> {}", file.display());
+                    }
+                    println!("{} pages at {width}px", selected.len());
+                }
+            }
+        }
+        Command::Images { out, inputs } => {
+            anyhow::ensure!(!inputs.is_empty(), "need at least one image");
+            let mut doc = images_to_pdf(&inputs)?;
+            save(&mut doc, &out)?;
+            println!("{} image(s) -> {} ({} pages)", inputs.len(), out.display(), info(&doc).pages);
         }
         Command::Runs { input, page } => {
             let doc = load(&input)?;

@@ -49,6 +49,8 @@ cargo run -p pdfaxe-cli -- edit-text in.pdf -o out.pdf --find "old" --replace "n
 cargo run -p pdfaxe-cli -- watermark in.pdf -o out.pdf --text "CONFIDENTIAL"
 cargo run -p pdfaxe-cli -- page-numbers in.pdf -o out.pdf --format "{page} / {total}"
 cargo run -p pdfaxe-cli -- redact in.pdf -o out.pdf --page 1 --rect "38,635,130,22"
+cargo run -p pdfaxe-cli -- render in.pdf -o pg.png --pages "1-3" --width 800   # pg-1.png…
+cargo run -p pdfaxe-cli -- images -o out.pdf scan1.jpg scan2.png
 cargo run -p pdfaxe-app              # the app; also: pdfaxe-app.exe some.pdf ("Open with")
 cargo build --release --workspace    # optimized binaries
 ```
@@ -92,6 +94,10 @@ cargo build --release --workspace    # optimized binaries
   redacted page returns nothing, other pages untouched, annotations dropped;
   CLI + render verified (black box exactly over SECRET-CODE-42, ~56 KB page at
   200 dpi).
+- Images↔PDF (July 13): `images` builds one page per image (JPEG embedded
+  as-is via DCTDecode — lossless; PNG re-encoded Flate RGB, alpha over white),
+  `render --pages "1-3"` exports numbered PNGs; round-trip verified (PDF →
+  PNGs → PDF → faithful render).
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -117,9 +123,9 @@ cargo build --release --workspace    # optimized binaries
 2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~, ~~multi-page
    continuous scroll + texture eviction~~ — remaining: keyboard navigation,
    search-in-document.
-3. More ops at parity with the web suite: images→PDF, PDF→images (have `render`),
-   ~~watermark~~, ~~page numbers~~, ~~redact~~ (engine+CLI; GUI box-drawing
-   pending).
+3. ~~More ops at parity with the web suite~~: ~~images→PDF~~, ~~PDF→images~~,
+   ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine+CLI all done; GUI
+   surfaces pending for redact (box drawing) and images→PDF (drop zone).
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
    MSI packaging, file association + "Open with PDFAxe", icon, code signing.
 5. Windows polish: jump lists, recent files, dark mode following system.
