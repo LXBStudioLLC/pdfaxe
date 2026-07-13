@@ -687,12 +687,15 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
     Ok(runs)
 }
 
-/// Replace the text of one run (same font, same start position) and patch the
-/// page's content stream. When the font's glyph widths are known and the edit
-/// changes the run's width, the rest of the line is shifted to fit and the
-/// shift is undone at the next line break (same-line reflow); otherwise the
-/// edit degrades to a pure in-place patch. Content-stream op indices may
-/// change — re-list runs after every edit.
+/// Replace the text of one run (same font) and patch the page's content
+/// stream. Layout preservation, best first:
+/// 1. Paragraph re-wrap — when the run is a line of recognizable wrapped
+///    prose, words redistribute across the paragraph's existing lines.
+/// 2. Same-line reflow — otherwise, when glyph widths are known, the rest of
+///    the run's line shifts by the width delta and un-shifts at the next
+///    line break.
+/// 3. In-place patch — when widths are unknown or the text matrix is rotated.
+/// Content-stream op indices may change — re-list runs after every edit.
 pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str) -> Result<()> {
     let pages = doc.get_pages();
     let &page_id = pages.get(&page_no).ok_or_else(|| anyhow!("page {page_no} out of range"))?;
@@ -710,6 +713,13 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
 
     let content_bytes = doc.get_page_content(page_id);
     let mut content = Content::decode(&content_bytes).map_err(|e| anyhow!("couldn't parse page content: {e}"))?;
+
+    if try_rewrap(&mut content.operations, run.op_index, run.tj_item, new_text, codec, &widths).is_some() {
+        let encoded = content.encode().map_err(|e| anyhow!("couldn't re-encode page content: {e}"))?;
+        doc.change_page_content(page_id, encoded)
+            .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
+        return Ok(());
+    }
 
     let op: &mut Operation = content
         .operations
@@ -734,6 +744,252 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
     doc.change_page_content(page_id, encoded)
         .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
     Ok(())
+}
+
+/// One whole-line show op, as collected for paragraph re-wrap.
+struct BlockLine {
+    op_index: usize,
+    /// `Some(0)` when the line is a single-string TJ.
+    tj_item: Option<usize>,
+    x: f32,
+    y: f32,
+    font_res: String,
+    st: AdvanceState,
+    bytes: Vec<u8>,
+    /// One string, translation-only matrices — safe to redistribute into.
+    simple: bool,
+}
+
+/// Word-processor-style paragraph re-wrap: replace the edited line's text and
+/// redistribute words across the *existing* lines of its paragraph so nothing
+/// overflows the paragraph's width. Only strings change — every line keeps
+/// its positioning ops — so the failure mode is refusing, never mangling.
+///
+/// A paragraph is only recognized when the evidence is strong: consecutive
+/// one-string lines sharing font, size and left margin, at uniform leading,
+/// with every line but the last near-full (ragged line-lists like addresses
+/// fail that test and fall back to same-line reflow). Overflow that no longer
+/// fits by the paragraph's last line stays on that line.
+///
+/// Returns `None` (without touching anything) when the block doesn't qualify.
+fn try_rewrap(
+    ops: &mut [Operation],
+    edit_op: usize,
+    edit_tj: Option<usize>,
+    new_text: &str,
+    codec: &FontCodec,
+    widths: &HashMap<String, GlyphWidths>,
+) -> Option<()> {
+    const X_EPS: f32 = 0.5;
+    const STEP_EPS: f32 = 0.5;
+    /// Lines this fraction of the block width count as "full" (wrapped).
+    const FULLNESS: f32 = 0.7;
+    let opnum = |op: &Operation, i: usize| op.operands.get(i).and_then(num).unwrap_or(0.0);
+
+    // Collect every whole-line show op in stream order.
+    let mut lines: Vec<BlockLine> = Vec::new();
+    let mut font_res = String::new();
+    let mut st = AdvanceState::default();
+    let mut tlm = (0.0f32, 0.0f32);
+    let mut leading = 0.0f32;
+    let mut pure = true;
+
+    for (i, op) in ops.iter().enumerate() {
+        match op.operator.as_str() {
+            "BT" => {
+                tlm = (0.0, 0.0);
+                pure = true;
+            }
+            "Tf" => {
+                if let Some(Object::Name(n)) = op.operands.first() {
+                    font_res = String::from_utf8_lossy(n).into_owned();
+                }
+                if let Some(sz) = op.operands.get(1).and_then(num) {
+                    st.font_size = sz;
+                }
+            }
+            "Tc" => st.char_spacing = opnum(op, 0),
+            "Tw" => st.word_spacing = opnum(op, 0),
+            "Tz" => st.h_scale = opnum(op, 0),
+            "TL" => leading = opnum(op, 0),
+            "Tm" => {
+                if op.operands.len() == 6 {
+                    let (a, b, c, d) = (opnum(op, 0), opnum(op, 1), opnum(op, 2), opnum(op, 3));
+                    if (a - 1.0).abs() > 0.05 || b.abs() > 0.05 || c.abs() > 0.05 || (d - 1.0).abs() > 0.05 {
+                        pure = false;
+                    }
+                    tlm = (opnum(op, 4), opnum(op, 5));
+                }
+            }
+            "Td" | "TD" => {
+                let (tx, ty) = (opnum(op, 0), opnum(op, 1));
+                if op.operator == "TD" {
+                    leading = -ty;
+                }
+                tlm = (tlm.0 + tx, tlm.1 + ty);
+            }
+            "T*" => tlm.1 -= leading,
+            "Tj" | "'" | "\"" => {
+                if op.operator == "\"" {
+                    st.word_spacing = opnum(op, 0);
+                    st.char_spacing = opnum(op, 1);
+                }
+                if op.operator != "Tj" {
+                    tlm.1 -= leading;
+                }
+                if let Some(Object::String(bytes, _)) =
+                    op.operands.iter().rev().find(|o| matches!(o, Object::String(..)))
+                {
+                    lines.push(BlockLine {
+                        op_index: i,
+                        tj_item: None,
+                        x: tlm.0,
+                        y: tlm.1,
+                        font_res: font_res.clone(),
+                        st,
+                        bytes: bytes.clone(),
+                        simple: pure,
+                    });
+                }
+            }
+            "TJ" => {
+                if let Some(Object::Array(items)) = op.operands.first() {
+                    // Only a lone string is a redistributable line; kerned
+                    // arrays would lose their adjustments.
+                    let lone = match items.as_slice() {
+                        [Object::String(bytes, _)] => Some(bytes.clone()),
+                        _ => None,
+                    };
+                    let simple = pure && lone.is_some();
+                    lines.push(BlockLine {
+                        op_index: i,
+                        tj_item: Some(0),
+                        x: tlm.0,
+                        y: tlm.1,
+                        font_res: font_res.clone(),
+                        st,
+                        bytes: lone.unwrap_or_default(),
+                        simple,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The edited line, by op identity. (A multi-item TJ never matches — its
+    // recorded tj_item is 0 with simple=false, and simple gates below.)
+    let e = lines
+        .iter()
+        .position(|l| l.op_index == edit_op && l.tj_item.is_some() == edit_tj.is_some())?;
+    if !lines[e].simple || edit_tj.is_some_and(|k| k != 0) {
+        return None;
+    }
+    if !codec.invertible {
+        return None;
+    }
+    let gw = widths.get(&lines[e].font_res)?;
+    let st_e = lines[e].st;
+
+    let same_family = |l: &BlockLine| {
+        l.simple
+            && l.font_res == lines[e].font_res
+            && (l.st.font_size - st_e.font_size).abs() < 0.01
+            && (l.x - lines[e].x).abs() < X_EPS
+    };
+
+    // Uniform leading, inferred from the nearest neighbor.
+    let step_ok = |above: &BlockLine, below: &BlockLine, lead: f32| {
+        let step = above.y - below.y;
+        step > 0.1 && (step - lead).abs() < STEP_EPS
+    };
+    let lead = if e + 1 < lines.len() && same_family(&lines[e + 1]) && lines[e].y - lines[e + 1].y > 0.1 {
+        lines[e].y - lines[e + 1].y
+    } else if e > 0 && same_family(&lines[e - 1]) && lines[e - 1].y - lines[e].y > 0.1 {
+        lines[e - 1].y - lines[e].y
+    } else {
+        return None; // no paragraph around this line
+    };
+    if lead > st_e.font_size * 3.0 {
+        return None;
+    }
+
+    let mut start = e;
+    while start > 0 && same_family(&lines[start - 1]) && step_ok(&lines[start - 1], &lines[start], lead) {
+        start -= 1;
+    }
+    let mut end = e; // inclusive
+    while end + 1 < lines.len() && same_family(&lines[end + 1]) && step_ok(&lines[end], &lines[end + 1], lead) {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+
+    // Paragraph width = the widest line; every line but the last must be
+    // near-full or this is a line list, not wrapped prose.
+    let mut line_w = Vec::with_capacity(end - start + 1);
+    for l in &lines[start..=end] {
+        line_w.push(advance(gw, &l.bytes, &st_e)?);
+    }
+    let w_max = line_w.iter().copied().fold(0.0f32, f32::max);
+    if w_max <= 1.0 {
+        return None;
+    }
+    if line_w[..line_w.len() - 1].iter().any(|&w| w < w_max * FULLNESS) {
+        return None;
+    }
+
+    // Gather words from the edited line onward and refill the slots greedily.
+    let mut words: Vec<String> = Vec::new();
+    for (k, l) in lines[e..=end].iter().enumerate() {
+        let text = if k == 0 { new_text.to_string() } else { codec.decode(&l.bytes) };
+        words.extend(text.split_whitespace().map(str::to_owned));
+    }
+
+    let slots = end - e + 1;
+    let mut new_lines: Vec<String> = Vec::with_capacity(slots);
+    let mut wi = 0usize;
+    for slot in 0..slots {
+        if slot + 1 == slots {
+            new_lines.push(words[wi..].join(" "));
+            break;
+        }
+        let mut cur = String::new();
+        while wi < words.len() {
+            let cand = if cur.is_empty() { words[wi].clone() } else { format!("{cur} {}", words[wi]) };
+            let cand_bytes = codec.encode(&cand)?;
+            if !cur.is_empty() && advance(gw, &cand_bytes, &st_e)? > w_max + 0.25 {
+                break;
+            }
+            cur = cand;
+            wi += 1;
+        }
+        new_lines.push(cur);
+    }
+
+    // Encode everything up front — an unencodable word must refuse the whole
+    // re-wrap, not leave the paragraph half-patched.
+    let mut encoded = Vec::with_capacity(new_lines.len());
+    for t in &new_lines {
+        encoded.push(codec.encode(t)?);
+    }
+
+    for (l, bytes) in lines[e..=end].iter().zip(encoded) {
+        let op = &mut ops[l.op_index];
+        let target = match l.tj_item {
+            None => op.operands.iter_mut().rev().find(|o| matches!(o, Object::String(..))),
+            Some(k) => match op.operands.first_mut() {
+                Some(Object::Array(items)) => items.get_mut(k),
+                _ => None,
+            },
+        };
+        match target {
+            Some(Object::String(b, _)) => *b = bytes,
+            _ => return None, // structurally impossible after collection
+        }
+    }
+    Some(())
 }
 
 /// After an in-place string edit changed a run's advance, shift what remains
@@ -1153,6 +1409,75 @@ mod tests {
         let ef = after.iter().find(|r| r.text == "EF").unwrap();
         assert!((cd.x - (120.0 + delta)).abs() < 0.01, "got x={}", cd.x);
         assert!((ef.x - 50.0).abs() < 0.01 && (ef.y - 680.0).abs() < 0.01, "absolute Tm lines must stay put");
+    }
+
+    /// Three near-full lines of Helvetica 12 prose — a recognizable paragraph.
+    const PARA: &[u8] = b"BT /F1 12 Tf 50 700 Td (The quick brown fox jumps over) Tj \
+                          0 -14 Td (the lazy dog while the cat naps) Tj \
+                          0 -14 Td (quietly indoors.) Tj ET";
+
+    #[test]
+    fn rewrap_cascades_overflow_through_paragraph() {
+        let mut doc = one_page_doc(helv(), PARA);
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs.len(), 3);
+        let w_max = runs.iter().map(|r| r.width.unwrap()).fold(0.0f32, f32::max);
+
+        edit_run(&mut doc, 1, &runs[0], "The extraordinarily quick brown fox jumps over").unwrap();
+
+        let after = text_runs(&doc, 1).unwrap();
+        assert_eq!(after.len(), 3, "line count must not change");
+        for (a, b) in runs.iter().zip(after.iter()) {
+            assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "positions must not move");
+        }
+        for r in &after[..2] {
+            assert!(
+                r.width.unwrap() <= w_max + 0.3,
+                "wrapped line overflows: {:?} ({} > {w_max})",
+                r.text,
+                r.width.unwrap()
+            );
+        }
+        let joined = after.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            joined,
+            "The extraordinarily quick brown fox jumps over the lazy dog while the cat naps quietly indoors."
+        );
+        assert_ne!(after[0].text, "The extraordinarily quick brown fox jumps over", "overflow must cascade");
+    }
+
+    #[test]
+    fn rewrap_pulls_words_up_on_shrink() {
+        let mut doc = one_page_doc(helv(), PARA);
+        let runs = text_runs(&doc, 1).unwrap();
+        edit_run(&mut doc, 1, &runs[0], "Tip.").unwrap();
+
+        let after = text_runs(&doc, 1).unwrap();
+        assert!(after[0].text.split_whitespace().count() > 1, "shrunk line must pull words up: {:?}", after[0].text);
+        let joined = after
+            .iter()
+            .map(|r| r.text.clone())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, "Tip. the lazy dog while the cat naps quietly indoors.");
+    }
+
+    #[test]
+    fn rewrap_refuses_ragged_line_lists() {
+        // Address-like block: same font/leading/margin but ragged widths —
+        // redistributing words here would corrupt meaning.
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td (John Smith) Tj \
+                               0 -14 Td (12 Foo Street Apt 4B Springfield) Tj \
+                               0 -14 Td (USA) Tj ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        edit_run(&mut doc, 1, &runs[0], "Johnathan Smithers").unwrap();
+
+        let after = text_runs(&doc, 1).unwrap();
+        assert_eq!(after[0].text, "Johnathan Smithers");
+        assert_eq!(after[1].text, "12 Foo Street Apt 4B Springfield", "line lists must stay line lists");
+        assert_eq!(after[2].text, "USA");
     }
 
     #[test]

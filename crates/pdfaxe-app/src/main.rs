@@ -661,7 +661,7 @@ impl eframe::App for PdfaxeApp {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new("TEXT ON THIS PAGE").color(pal.text_weak).small().strong());
                     ui.label(
-                        egui::RichText::new("Same font · the line reflows to fit. Paragraph re-wrap is on the roadmap.")
+                        egui::RichText::new("Same font · paragraphs re-wrap when detected, other lines reflow in place.")
                             .color(pal.text_weak)
                             .small(),
                     );

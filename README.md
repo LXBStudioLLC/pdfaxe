@@ -80,6 +80,12 @@ cargo build --release --workspace    # optimized binaries
   evicted outside a viewport-height band, page list follows scroll and vice versa;
   screenshot-verified via `--page 4` deep-link (viewport and thumbnail both land on
   page 4).
+- Paragraph re-wrap (July 13): edits redistribute words across the paragraph's
+  existing lines (positions untouched — only strings change), overflow cascades
+  down and shrink pulls words up; recognition requires uniform font/size/margin/
+  leading and near-full lines, so ragged line-lists (addresses) refuse and fall
+  back to same-line reflow. Render-verified: a 40-char-longer replacement wraps
+  onto the next line instead of overflowing the margin.
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -98,9 +104,10 @@ cargo build --release --workspace    # optimized binaries
 1. **Text editing (the wedge, Phase 1):** ~~v1 shipped~~ — positioned runs, in-place
    same-font edits, find/replace, `/Encoding` names + `/Differences` + symbolic-font
    protection (`pdfaxe-core/src/text.rs`). ~~Same-line reflow~~ (`metrics.rs` +
-   `reflow_line`). Next: paragraph re-wrap across lines, then font re-embedding for
-   arbitrary new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
-   `skrifa`/`klippa`).
+   `reflow_line`). ~~Paragraph re-wrap~~ (`try_rewrap` — conservative block
+   detection, strings-only redistribution). Next: font re-embedding for arbitrary
+   new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
+   `skrifa`/`klippa`), then cross-block re-wrap (new-line creation).
 2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~, ~~multi-page
    continuous scroll + texture eviction~~ — remaining: keyboard navigation,
    search-in-document.
