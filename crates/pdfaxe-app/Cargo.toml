@@ -1,0 +1,11 @@
+[package]
+name = "pdfaxe-app"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+eframe = "0.35.0"
+pdfaxe-core = { version = "0.1.0", path = "../pdfaxe-core" }
+rfd = "0.17.2"

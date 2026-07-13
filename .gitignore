@@ -1,0 +1,4 @@
+target/
+*.pdf.bak
+# machine-specific: sets a local target-dir outside the synced folder
+.cargo/config.toml

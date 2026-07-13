@@ -1,0 +1,707 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod theme;
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use eframe::egui;
+use pdfaxe_core::lopdf::Document;
+use pdfaxe_core::render::render_page_rgba;
+use pdfaxe_core::text::{edit_run, text_runs, TextRun};
+use pdfaxe_core::{assemble, info, load, save, PageSel};
+
+/// Thumbnail raster width, pixels.
+const THUMB_WIDTH: u32 = 150;
+/// The main view re-rasterizes in steps of this many pixels as zoom/window
+/// size change, so a resize drag doesn't re-render every frame.
+const RENDER_STEP_PX: f32 = 300.0;
+const MIN_RENDER_PX: u32 = 600;
+const MAX_RENDER_PX: u32 = 3000;
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1250.0, 800.0])
+            .with_min_inner_size([820.0, 520.0])
+            .with_title("PDFAxe — your files never leave this machine"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "PDFAxe",
+        options,
+        Box::new(|_cc| {
+            let mut app = PdfaxeApp::default();
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            app.dark = args.iter().any(|a| a == "--dark");
+            app.edit_mode = args.iter().any(|a| a == "--edit");
+            if let Some(path) = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from) {
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+                    app.open_path(path);
+                }
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+struct Row {
+    src_page: u32,
+    rotation: i64,
+}
+
+struct OpenDoc {
+    path: PathBuf,
+    /// Serialized current state — feeds the renderer; refreshed after edits.
+    bytes: Vec<u8>,
+    doc: Document,
+    rows: Vec<Row>,
+    selected: usize,
+    /// Main-view texture per page, tagged with the pixel width it was rendered at.
+    textures: HashMap<u32, (egui::TextureHandle, u32)>,
+    thumbs: HashMap<u32, egui::TextureHandle>,
+    /// Thumbnails the page list wants rendered (refilled every frame).
+    thumb_wants: Vec<u32>,
+    thumb_failed: HashSet<u32>,
+    page_points: HashMap<u32, (f32, f32)>,
+    render_errors: HashMap<u32, String>,
+    runs_cache: HashMap<u32, Vec<TextRun>>,
+    selected_run: Option<usize>,
+    edit_buffer: String,
+    edited: bool,
+}
+
+impl OpenDoc {
+    fn invalidate_page(&mut self, page: u32) {
+        self.textures.remove(&page);
+        self.thumbs.remove(&page);
+        self.thumb_failed.remove(&page);
+        self.render_errors.remove(&page);
+        self.runs_cache.remove(&page);
+    }
+
+    fn refresh_bytes(&mut self) {
+        let mut buf = Vec::new();
+        if self.doc.save_to(&mut buf).is_ok() {
+            self.bytes = buf;
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Zoom {
+    /// Track the viewport width (the default).
+    FitWidth,
+    /// Fixed scale — 1.0 shows one PDF point per egui point.
+    Scale(f32),
+}
+
+const ZOOM_LEVELS: [f32; 10] = [0.5, 0.67, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0];
+
+fn zoom_in(cur: f32) -> f32 {
+    ZOOM_LEVELS.iter().copied().find(|&z| z > cur * 1.01).unwrap_or(4.0)
+}
+
+fn zoom_out(cur: f32) -> f32 {
+    ZOOM_LEVELS.iter().rev().copied().find(|&z| z < cur * 0.99).unwrap_or(0.5)
+}
+
+struct PdfaxeApp {
+    open: Option<OpenDoc>,
+    status: String,
+    dark: bool,
+    theme_applied: Option<bool>,
+    edit_mode: bool,
+    zoom: Zoom,
+    /// Effective scale of fit-width as of the last frame — the anchor when
+    /// stepping from Fit to an explicit zoom level.
+    last_fit_zoom: f32,
+}
+
+impl Default for PdfaxeApp {
+    fn default() -> Self {
+        Self {
+            open: None,
+            status: String::new(),
+            dark: false,
+            theme_applied: None,
+            edit_mode: false,
+            zoom: Zoom::FitWidth,
+            last_fit_zoom: 1.0,
+        }
+    }
+}
+
+impl PdfaxeApp {
+    fn open_path(&mut self, path: PathBuf) {
+        let loaded = load(&path).and_then(|doc| {
+            let bytes = std::fs::read(&path)?;
+            Ok((doc, bytes))
+        });
+        match loaded {
+            Ok((doc, bytes)) => {
+                let pages = info(&doc).pages;
+                self.status = format!("Opened {} ({pages} pages)", path.display());
+                self.open = Some(OpenDoc {
+                    path,
+                    bytes,
+                    doc,
+                    rows: (1..=pages).map(|p| Row { src_page: p, rotation: 0 }).collect(),
+                    selected: 0,
+                    textures: HashMap::new(),
+                    thumbs: HashMap::new(),
+                    thumb_wants: Vec::new(),
+                    thumb_failed: HashSet::new(),
+                    page_points: HashMap::new(),
+                    render_errors: HashMap::new(),
+                    runs_cache: HashMap::new(),
+                    selected_run: None,
+                    edit_buffer: String::new(),
+                    edited: false,
+                });
+            }
+            Err(e) => self.status = format!("Couldn't open: {e:#}"),
+        }
+    }
+
+    fn open_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
+            self.open_path(path);
+        }
+    }
+
+    fn save_as(&mut self) {
+        let Some(open) = &self.open else { return };
+        if open.rows.is_empty() {
+            self.status = "All pages are deleted — nothing to save.".into();
+            return;
+        }
+        let Some(out) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name("pdfaxe-output.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        // Rebuild from the *current* (possibly text-edited) document state.
+        let result = Document::load_mem(&open.bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|fresh| {
+                let sels: Vec<PageSel> = open
+                    .rows
+                    .iter()
+                    .map(|r| PageSel { page: r.src_page, extra_rotation: r.rotation })
+                    .collect();
+                assemble(vec![(fresh, sels)])
+            });
+        match result {
+            Ok(mut doc) => match save(&mut doc, &out) {
+                Ok(()) => self.status = format!("Saved {} ({} pages)", out.display(), info(&doc).pages),
+                Err(e) => self.status = format!("Save failed: {e:#}"),
+            },
+            Err(e) => self.status = format!("Save failed: {e:#}"),
+        }
+    }
+}
+
+impl eframe::App for PdfaxeApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if self.theme_applied != Some(self.dark) {
+            theme::apply(&ctx, self.dark);
+            self.theme_applied = Some(self.dark);
+        }
+        let pal = theme::palette(self.dark);
+
+        // Drag & drop a PDF anywhere onto the window.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")))
+                .collect()
+        });
+        if let Some(path) = dropped.into_iter().next() {
+            self.open_path(path);
+        }
+
+        let card_frame = egui::Frame::new()
+            .fill(pal.card_bg)
+            .inner_margin(egui::Margin::symmetric(12, 8));
+
+        egui::Panel::top("top").resizable(false).frame(card_frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::wordmark(22.0, pal.text));
+                ui.add_space(10.0);
+                ui.separator();
+                if ui.add(theme::primary_button("Open…")).clicked() {
+                    self.open_dialog();
+                }
+                let can_save = self.open.as_ref().is_some_and(|o| !o.rows.is_empty());
+                if ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked() {
+                    self.save_as();
+                }
+                if self.open.is_some() {
+                    let label = if self.edit_mode { "✏ Editing text" } else { "Edit text" };
+                    if ui.selectable_label(self.edit_mode, label).clicked() {
+                        self.edit_mode = !self.edit_mode;
+                    }
+                    ui.separator();
+                    let cur = match self.zoom {
+                        Zoom::FitWidth => self.last_fit_zoom,
+                        Zoom::Scale(z) => z,
+                    };
+                    if ui.small_button("−").on_hover_text("Zoom out (or Ctrl+scroll)").clicked() {
+                        self.zoom = Zoom::Scale(zoom_out(cur));
+                    }
+                    let zoom_label = match self.zoom {
+                        Zoom::FitWidth => format!("Fit · {:.0}%", cur * 100.0),
+                        Zoom::Scale(z) => format!("{:.0}%", z * 100.0),
+                    };
+                    if ui
+                        .selectable_label(self.zoom == Zoom::FitWidth, zoom_label)
+                        .on_hover_text("Click to fit the page to the window")
+                        .clicked()
+                    {
+                        self.zoom = Zoom::FitWidth;
+                    }
+                    if ui.small_button("+").on_hover_text("Zoom in (or Ctrl+scroll)").clicked() {
+                        self.zoom = Zoom::Scale(zoom_in(cur));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(if self.dark { "Light mode" } else { "Dark mode" })
+                        .on_hover_text("Toggle theme")
+                        .clicked()
+                    {
+                        self.dark = !self.dark;
+                    }
+                    ui.label(
+                        egui::RichText::new("local-only · no uploads · free forever")
+                            .color(pal.text_weak),
+                    );
+                });
+            });
+        });
+
+        egui::Panel::bottom("status").resizable(false).frame(card_frame).show(ui, |ui| {
+            let text = if self.status.is_empty() {
+                "Drop a PDF anywhere, or click Open…".to_owned()
+            } else {
+                self.status.clone()
+            };
+            ui.label(egui::RichText::new(text).color(pal.text_weak).small());
+        });
+
+        let Some(open) = &mut self.open else {
+            egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(150.0);
+                    ui.label(theme::wordmark(34.0, pal.text));
+                    ui.add_space(10.0);
+                    ui.heading("The PDF app that doesn't upload your files");
+                    ui.label(
+                        egui::RichText::new("No accounts. No cloud. No watermarks. Free forever — in writing.")
+                            .color(pal.text_weak),
+                    );
+                    ui.add_space(16.0);
+                    if ui.add(theme::primary_button("Open a PDF…")).clicked() {
+                        self.open_dialog();
+                    }
+                });
+            });
+            return;
+        };
+
+        // Rasterize at most a couple of queued thumbnails per frame so large
+        // documents never freeze the UI; the page list re-queues what's missing.
+        let wants = std::mem::take(&mut open.thumb_wants);
+        let mut thumb_budget = 2usize;
+        for tp in wants {
+            if open.thumbs.contains_key(&tp) || open.thumb_failed.contains(&tp) || thumb_budget == 0 {
+                continue;
+            }
+            thumb_budget -= 1;
+            match render_page_rgba(&open.bytes, tp, THUMB_WIDTH) {
+                Ok(r) => {
+                    let image = egui::ColorImage::from_rgba_premultiplied(
+                        [r.width as usize, r.height as usize],
+                        &r.pixels,
+                    );
+                    let tex = ctx.load_texture(format!("thumb-{tp}"), image, egui::TextureOptions::LINEAR);
+                    open.thumbs.insert(tp, tex);
+                    open.page_points.entry(tp).or_insert((r.point_width, r.point_height));
+                }
+                Err(_) => {
+                    open.thumb_failed.insert(tp);
+                }
+            }
+        }
+
+        // ----- left: page list -----
+        let mut move_up: Option<usize> = None;
+        let mut move_down: Option<usize> = None;
+        let mut rotate: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        let mut want_thumbs: Vec<u32> = Vec::new();
+
+        egui::Panel::left("pages")
+            .resizable(true)
+            .default_size(240.0)
+            .frame(card_frame)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(format!("{} PAGES", open.rows.len())).color(pal.text_weak).small().strong());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for i in 0..open.rows.len() {
+                        let row = &open.rows[i];
+                        let page = row.src_page;
+                        let is_sel = open.selected == i;
+                        let card = egui::Frame::new()
+                            .fill(if is_sel { pal.selected_bg } else { egui::Color32::TRANSPARENT })
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(6));
+                        card.show(ui, |ui| {
+                            let thumb_w = ui.available_width().clamp(40.0, 150.0);
+                            let (pw, ph) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
+                            let size = egui::vec2(thumb_w, thumb_w * ph / pw.max(1.0));
+                            let clicked = if let Some(tex) = open.thumbs.get(&page) {
+                                let resp = ui.add(
+                                    egui::Image::new(tex)
+                                        .fit_to_exact_size(size)
+                                        .corner_radius(2.0)
+                                        .sense(egui::Sense::click()),
+                                );
+                                let stroke = if is_sel {
+                                    egui::Stroke::new(2.0, theme::AXE_ORANGE)
+                                } else {
+                                    egui::Stroke::new(1.0, pal.border)
+                                };
+                                ui.painter().rect_stroke(resp.rect, 2.0, stroke, egui::StrokeKind::Outside);
+                                resp.clicked()
+                            } else {
+                                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                                if ui.is_rect_visible(rect) {
+                                    ui.painter().rect_filled(rect, 2.0, pal.page_bg);
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        2.0,
+                                        egui::Stroke::new(1.0, pal.border),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("page {page}"),
+                                        egui::FontId::proportional(11.0),
+                                        pal.text_weak,
+                                    );
+                                    if !open.thumb_failed.contains(&page) {
+                                        want_thumbs.push(page);
+                                    }
+                                }
+                                resp.clicked()
+                            };
+                            if clicked {
+                                open.selected = i;
+                                open.selected_run = None;
+                            }
+                            let label = if row.rotation != 0 {
+                                format!("#{} · p{} · +{}° on save", i + 1, page, row.rotation)
+                            } else {
+                                format!("#{} · p{}", i + 1, page)
+                            };
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .small()
+                                    .color(if is_sel { pal.text } else { pal.text_weak }),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.small_button("^").on_hover_text("Move up").clicked() {
+                                    move_up = Some(i);
+                                }
+                                if ui.small_button("v").on_hover_text("Move down").clicked() {
+                                    move_down = Some(i);
+                                }
+                                if ui.small_button("R").on_hover_text("Rotate 90° (applied on save)").clicked() {
+                                    rotate = Some(i);
+                                }
+                                if ui.small_button("X").on_hover_text("Delete").clicked() {
+                                    delete = Some(i);
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+
+        open.thumb_wants = want_thumbs;
+        if !open.thumb_wants.is_empty() {
+            // Thumbnails still pending — keep frames coming until they're in.
+            ctx.request_repaint();
+        }
+
+        if let Some(i) = move_up {
+            if i > 0 {
+                open.rows.swap(i, i - 1);
+                open.selected = i - 1;
+            }
+        }
+        if let Some(i) = move_down {
+            if i + 1 < open.rows.len() {
+                open.rows.swap(i, i + 1);
+                open.selected = i + 1;
+            }
+        }
+        if let Some(i) = rotate {
+            open.rows[i].rotation = (open.rows[i].rotation + 90) % 360;
+        }
+        if let Some(i) = delete {
+            open.rows.remove(i);
+            if open.selected >= open.rows.len() && open.selected > 0 {
+                open.selected = open.rows.len() - 1;
+            }
+        }
+
+        let Some(current_row) = open.rows.get(open.selected) else {
+            return;
+        };
+        let page = current_row.src_page;
+
+        // ----- right: text editor -----
+        if self.edit_mode {
+            if !open.runs_cache.contains_key(&page) {
+                match text_runs(&open.doc, page) {
+                    Ok(runs) => {
+                        open.runs_cache.insert(page, runs);
+                    }
+                    Err(e) => {
+                        open.runs_cache.insert(page, Vec::new());
+                        self.status = format!("Couldn't read text: {e:#}");
+                    }
+                }
+            }
+            let mut apply_edit: Option<TextRun> = None;
+
+            egui::Panel::right("editor")
+                .resizable(true)
+                .default_size(320.0)
+                .frame(card_frame)
+                .show(ui, |ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("TEXT ON THIS PAGE").color(pal.text_weak).small().strong());
+                    ui.label(
+                        egui::RichText::new("Same font, same position — reflow is the next milestone.")
+                            .color(pal.text_weak)
+                            .small(),
+                    );
+                    ui.add_space(6.0);
+
+                    let runs = open.runs_cache.get(&page).cloned().unwrap_or_default();
+                    egui::ScrollArea::vertical().max_height(ui.available_height() * 0.55).show(ui, |ui| {
+                        for (i, run) in runs.iter().enumerate() {
+                            let mut label = run.text.clone();
+                            if label.len() > 42 {
+                                label.truncate(42);
+                                label.push('…');
+                            }
+                            if label.trim().is_empty() {
+                                label = "(spaces)".into();
+                            }
+                            if !run.editable {
+                                label = format!("🔒 {label}");
+                            }
+                            if ui.selectable_label(open.selected_run == Some(i), label).clicked() {
+                                open.selected_run = Some(i);
+                                open.edit_buffer = run.text.clone();
+                            }
+                        }
+                        if runs.is_empty() {
+                            ui.label(egui::RichText::new("(no text on this page)").color(pal.text_weak));
+                        }
+                    });
+
+                    ui.separator();
+                    if let Some(ri) = open.selected_run {
+                        if let Some(run) = runs.get(ri) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {:.0}pt {}",
+                                    run.font_res,
+                                    run.font_size,
+                                    if run.editable { "" } else { "· read-only (complex font)" }
+                                ))
+                                .color(pal.text_weak)
+                                .small(),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut open.edit_buffer)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(run.editable),
+                            );
+                            ui.add_space(4.0);
+                            if run.editable
+                                && ui.add(theme::primary_button("Apply edit")).clicked()
+                                && open.edit_buffer != run.text
+                            {
+                                apply_edit = Some(run.clone());
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Select a line here or click text on the page.")
+                                .color(pal.text_weak),
+                        );
+                    }
+                });
+
+            if let Some(run) = apply_edit {
+                match edit_run(&mut open.doc, page, &run, &open.edit_buffer) {
+                    Ok(()) => {
+                        open.refresh_bytes();
+                        open.invalidate_page(page);
+                        open.selected_run = None;
+                        open.edited = true;
+                        self.status = "Edited — rendering the result…".into();
+                    }
+                    Err(e) => self.status = format!("Edit failed: {e:#}"),
+                }
+            }
+        }
+
+        // ----- center: rendered page -----
+        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            let file_name = open
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{file_name}{} · PDF {} · page {page}",
+                    if open.edited { " (edited)" } else { "" },
+                    info(&open.doc).version,
+                ))
+                .color(pal.text_weak)
+                .small(),
+            );
+            ui.add_space(4.0);
+
+            // Ctrl+scroll (or pinch) zooms the page view.
+            if ui.ui_contains_pointer() {
+                let zd = ctx.input(|i| i.zoom_delta());
+                if (zd - 1.0).abs() > 0.001 {
+                    let cur = match self.zoom {
+                        Zoom::FitWidth => self.last_fit_zoom,
+                        Zoom::Scale(z) => z,
+                    };
+                    self.zoom = Zoom::Scale((cur * zd).clamp(0.25, 5.0));
+                }
+            }
+
+            let avail = ui.available_width().max(200.0);
+            let (pw_hint, _) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
+            let display_w_hint = match self.zoom {
+                Zoom::FitWidth => avail,
+                Zoom::Scale(z) => pw_hint * z,
+            };
+            let want_px = (((display_w_hint * ctx.pixels_per_point() / RENDER_STEP_PX).ceil()
+                * RENDER_STEP_PX) as u32)
+                .clamp(MIN_RENDER_PX, MAX_RENDER_PX);
+            let needs_render = open.textures.get(&page).is_none_or(|(_, w)| *w != want_px)
+                && !open.render_errors.contains_key(&page);
+            if needs_render {
+                match render_page_rgba(&open.bytes, page, want_px) {
+                    Ok(rendered) => {
+                        let image = egui::ColorImage::from_rgba_premultiplied(
+                            [rendered.width as usize, rendered.height as usize],
+                            &rendered.pixels,
+                        );
+                        let tex = ctx.load_texture(format!("page-{page}"), image, egui::TextureOptions::LINEAR);
+                        open.textures.insert(page, (tex, want_px));
+                        open.page_points.insert(page, (rendered.point_width, rendered.point_height));
+                    }
+                    Err(e) => {
+                        open.render_errors.insert(page, format!("{e:#}"));
+                    }
+                }
+            }
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                if let Some((tex, _)) = open.textures.get(&page) {
+                    let (pw, ph) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
+                    self.last_fit_zoom = avail / pw.max(1.0);
+                    let display_w = match self.zoom {
+                        Zoom::FitWidth => avail,
+                        Zoom::Scale(z) => pw * z,
+                    };
+                    let response = ui.add(
+                        egui::Image::new(tex)
+                            .fit_to_exact_size(egui::vec2(display_w, display_w * ph / pw.max(1.0)))
+                            .corner_radius(3.0)
+                            .sense(egui::Sense::click()),
+                    );
+                    let rect = response.rect;
+                    let s = rect.width() / pw.max(1.0);
+
+                    // Click text on the page to select it for editing.
+                    if self.edit_mode {
+                        if let (true, Some(pos)) = (response.clicked(), response.interact_pointer_pos()) {
+                            let px = (pos.x - rect.min.x) / s;
+                            let py = ph - (pos.y - rect.min.y) / s;
+                            if let Some(runs) = open.runs_cache.get(&page) {
+                                let mut best: Option<(usize, f32)> = None;
+                                for (i, run) in runs.iter().enumerate() {
+                                    let width_est = run.text.chars().count() as f32 * run.font_size * 0.55;
+                                    let within_x = px >= run.x - 4.0 && px <= run.x + width_est + 8.0;
+                                    let dy = (py - run.y - run.font_size * 0.3).abs();
+                                    if within_x && dy < run.font_size * 1.2 {
+                                        if best.is_none_or(|(_, d)| dy < d) {
+                                            best = Some((i, dy));
+                                        }
+                                    }
+                                }
+                                if let Some((i, _)) = best {
+                                    open.selected_run = Some(i);
+                                    open.edit_buffer = runs[i].text.clone();
+                                }
+                            }
+                        }
+
+                        // Highlight the selected run on the page.
+                        if let Some(ri) = open.selected_run {
+                            if let Some(run) = open.runs_cache.get(&page).and_then(|r| r.get(ri)) {
+                                let width_est =
+                                    (run.text.chars().count() as f32 * run.font_size * 0.55).max(12.0);
+                                let h = run.font_size * 1.3;
+                                let min = egui::pos2(
+                                    rect.min.x + run.x * s,
+                                    rect.min.y + (ph - run.y - run.font_size) * s,
+                                );
+                                let hi_rect = egui::Rect::from_min_size(
+                                    min,
+                                    egui::vec2(width_est * s, h * s),
+                                );
+                                ui.painter().rect_stroke(
+                                    hi_rect,
+                                    2.0,
+                                    egui::Stroke::new(2.0, theme::AXE_ORANGE_BRIGHT),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(err) = open.render_errors.get(&page) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xB9, 0x1C, 0x1C),
+                        format!("Couldn't render this page: {err}"),
+                    );
+                }
+            });
+        });
+    }
+}

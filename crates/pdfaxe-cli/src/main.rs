@@ -1,0 +1,218 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use pdfaxe_core::ops::all_pages;
+use pdfaxe_core::{
+    assemble, extract_text, info, load, page_numbers, parse_ranges, rotate_pages, save,
+    watermark, PageSel, StampOpts,
+};
+
+#[derive(Parser)]
+#[command(name = "pdfaxe", version, about = "PDFAxe — local, private PDF surgery. Nothing leaves your machine.")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Show page count, PDF version and encryption status
+    Info { file: PathBuf },
+    /// Merge PDFs into one, in argument order
+    Merge {
+        /// Output file
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Input files, in order
+        inputs: Vec<PathBuf>,
+    },
+    /// Extract pages into a new PDF (e.g. --pages "1-3,5,8-")
+    Extract {
+        #[arg(short, long)]
+        out: PathBuf,
+        input: PathBuf,
+        #[arg(short, long)]
+        pages: String,
+    },
+    /// Rotate pages clockwise by 90/180/270 degrees
+    Rotate {
+        #[arg(short, long)]
+        out: PathBuf,
+        input: PathBuf,
+        #[arg(short, long, value_parser = clap::value_parser!(i64))]
+        degrees: i64,
+        /// Pages to rotate (default: all), e.g. "2,5-7"
+        #[arg(short, long)]
+        pages: Option<String>,
+    },
+    /// Extract the text of one page (reconstruction pipeline starts here)
+    Text {
+        input: PathBuf,
+        #[arg(short, long, default_value_t = 1)]
+        page: u32,
+    },
+    /// Render one page to a PNG (pure-Rust rasterizer)
+    Render {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(short, long, default_value_t = 1)]
+        page: u32,
+        #[arg(short, long, default_value_t = 1200)]
+        width: u32,
+    },
+    /// List the text runs of a page (font, size, position, editability)
+    Runs {
+        input: PathBuf,
+        #[arg(short, long, default_value_t = 1)]
+        page: u32,
+    },
+    /// Find & replace text in place — same font, same position
+    EditText {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long)]
+        find: String,
+        #[arg(long)]
+        replace: String,
+        /// Page to edit (default: all pages)
+        #[arg(short, long)]
+        page: Option<u32>,
+    },
+    /// Stamp a translucent diagonal watermark across pages
+    Watermark {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(short, long)]
+        text: String,
+        /// Pages to stamp (default: all), e.g. "1-3,5"
+        #[arg(short, long)]
+        pages: Option<String>,
+        #[arg(long, default_value_t = 48.0)]
+        size: f32,
+        #[arg(long, default_value_t = 0.35)]
+        alpha: f32,
+        #[arg(long, default_value_t = 45.0)]
+        angle: f32,
+        #[arg(long, default_value_t = 0.6)]
+        gray: f32,
+    },
+    /// Add page numbers at the bottom ("{page}" and "{total}" placeholders)
+    PageNumbers {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(short, long, default_value = "{page} / {total}")]
+        format: String,
+        #[arg(long, default_value_t = 10.0)]
+        size: f32,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Info { file } => {
+            let doc = load(&file)?;
+            let i = info(&doc);
+            println!("file:      {}", file.display());
+            println!("pages:     {}", i.pages);
+            println!("version:   {}", i.version);
+            println!("encrypted: {}", if i.encrypted { "yes" } else { "no" });
+        }
+        Command::Merge { out, inputs } => {
+            anyhow::ensure!(inputs.len() >= 2, "need at least two input files");
+            let mut parts = Vec::new();
+            for path in &inputs {
+                let doc = load(path)?;
+                let sels = all_pages(&doc);
+                parts.push((doc, sels));
+            }
+            let mut merged = assemble(parts)?;
+            save(&mut merged, &out)?;
+            println!("merged {} files -> {} ({} pages)", inputs.len(), out.display(), info(&merged).pages);
+        }
+        Command::Extract { out, input, pages } => {
+            let doc = load(&input)?;
+            let count = info(&doc).pages;
+            let selected = parse_ranges(&pages, count)?;
+            let sels: Vec<PageSel> = selected.iter().map(|&p| PageSel::plain(p)).collect();
+            let n = sels.len();
+            let mut result = assemble(vec![(doc, sels)])?;
+            save(&mut result, &out)?;
+            println!("extracted {n} pages -> {}", out.display());
+        }
+        Command::Rotate { out, input, degrees, pages } => {
+            anyhow::ensure!(degrees % 90 == 0, "degrees must be a multiple of 90");
+            let mut doc = load(&input)?;
+            let count = info(&doc).pages;
+            let selected = match pages {
+                Some(expr) => parse_ranges(&expr, count)?,
+                None => (1..=count).collect(),
+            };
+            rotate_pages(&mut doc, &selected, degrees)?;
+            save(&mut doc, &out)?;
+            println!("rotated {} pages by {degrees}° -> {}", selected.len(), out.display());
+        }
+        Command::Text { input, page } => {
+            let doc = load(&input)?;
+            println!("{}", extract_text(&doc, page)?);
+        }
+        Command::Render { input, out, page, width } => {
+            let bytes = std::fs::read(&input)?;
+            let png = pdfaxe_core::render::render_page_png(&bytes, page, width)?;
+            std::fs::write(&out, png)?;
+            println!("rendered page {page} at {width}px -> {}", out.display());
+        }
+        Command::Runs { input, page } => {
+            let doc = load(&input)?;
+            for (i, run) in pdfaxe_core::text::text_runs(&doc, page)?.iter().enumerate() {
+                println!(
+                    "[{i:3}] {} {:>5.1}pt @({:.0},{:.0}) {} {:?}",
+                    run.font_res,
+                    run.font_size,
+                    run.x,
+                    run.y,
+                    if run.editable { "editable" } else { "read-only" },
+                    run.text,
+                );
+            }
+        }
+        Command::EditText { input, out, find, replace, page } => {
+            let mut doc = load(&input)?;
+            let pages: Vec<u32> = match page {
+                Some(p) => vec![p],
+                None => (1..=info(&doc).pages).collect(),
+            };
+            let mut total = 0;
+            for p in pages {
+                total += pdfaxe_core::text::find_replace(&mut doc, p, &find, &replace)?;
+            }
+            save(&mut doc, &out)?;
+            println!("replaced {total} occurrence(s) -> {}", out.display());
+        }
+        Command::Watermark { input, out, text, pages, size, alpha, angle, gray } => {
+            let mut doc = load(&input)?;
+            let count = info(&doc).pages;
+            let selected = match pages {
+                Some(expr) => parse_ranges(&expr, count)?,
+                None => (1..=count).collect(),
+            };
+            let opts = StampOpts { size, gray, alpha, angle };
+            watermark(&mut doc, &selected, &text, &opts)?;
+            save(&mut doc, &out)?;
+            println!("watermarked {} pages -> {}", selected.len(), out.display());
+        }
+        Command::PageNumbers { input, out, format, size } => {
+            let mut doc = load(&input)?;
+            let opts = StampOpts { size, gray: 0.33, ..Default::default() };
+            let total = page_numbers(&mut doc, &format, &opts)?;
+            save(&mut doc, &out)?;
+            println!("numbered {total} pages -> {}", out.display());
+        }
+    }
+    Ok(())
+}

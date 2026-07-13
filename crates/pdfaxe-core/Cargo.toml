@@ -1,0 +1,12 @@
+[package]
+name = "pdfaxe-core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+hayro = "0.7.1"
+lopdf = "0.44.0"
+png = "0.18.1"
+thiserror = "2.0.18"
