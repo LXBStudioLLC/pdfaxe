@@ -11,8 +11,9 @@
 //!   rest of the line shifts to fit the new width and the shift is undone at
 //!   the next line break — same-line reflow. Paragraph re-wrap (moving words
 //!   across lines) is not attempted yet.
-//! - Positions are the text-matrix origin at the start of each show op;
-//!   within-line advances are not simulated yet (good enough for hitboxes).
+//! - Positions include within-line advances whenever glyph widths are known
+//!   (/Widths or standard-14 metrics); otherwise they fall back to the show
+//!   op's start position.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -37,6 +38,8 @@ pub struct TextRun {
     /// Text-space origin (baseline) at the start of the run, PDF points.
     pub x: f32,
     pub y: f32,
+    /// Advance width in text-space points, when the font is measurable.
+    pub width: Option<f32>,
     pub text: String,
     pub editable: bool,
 }
@@ -545,10 +548,13 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
     let content_bytes = doc.get_page_content(page_id);
     let content = Content::decode(&content_bytes).map_err(|e| anyhow!("couldn't parse page content: {e}"))?;
     let codecs = page_font_codecs(doc, page_id);
+    let widths = page_font_widths(doc, page_id);
 
     let mut runs = Vec::new();
     let mut font_res = String::new();
     let mut font_size = 0.0f32;
+    // Tc / Tw / Tz — they scale run widths.
+    let (mut char_sp, mut word_sp, mut h_scale) = (0.0f32, 0.0f32, 100.0f32);
     // text matrix origin (e,f) and line matrix origin
     let mut tm = (0.0f32, 0.0f32);
     let mut tlm = (0.0f32, 0.0f32);
@@ -595,11 +601,18 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
             "TL" => {
                 leading = op.operands.first().and_then(num).unwrap_or(0.0);
             }
+            "Tc" => char_sp = op.operands.first().and_then(num).unwrap_or(0.0),
+            "Tw" => word_sp = op.operands.first().and_then(num).unwrap_or(0.0),
+            "Tz" => h_scale = op.operands.first().and_then(num).unwrap_or(100.0),
             "T*" => {
                 tlm = (tlm.0, tlm.1 - leading);
                 tm = tlm;
             }
             "Tj" | "'" | "\"" => {
+                if op.operator == "\"" {
+                    word_sp = op.operands.first().and_then(num).unwrap_or(word_sp);
+                    char_sp = op.operands.get(1).and_then(num).unwrap_or(char_sp);
+                }
                 if op.operator != "Tj" {
                     tlm = (tlm.0, tlm.1 - leading);
                     tm = tlm;
@@ -609,6 +622,8 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
                     _ => None,
                 });
                 if let Some(bytes) = string_operand {
+                    let st = AdvanceState { font_size, char_spacing: char_sp, word_spacing: word_sp, h_scale };
+                    let width = widths.get(&font_res).and_then(|gw| advance(gw, &bytes, &st));
                     let (text, editable) = decode(&font_res, &bytes);
                     runs.push(TextRun {
                         op_index,
@@ -617,27 +632,52 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
                         font_size,
                         x: tm.0,
                         y: tm.1,
+                        width,
                         text,
                         editable,
                     });
+                    if let Some(w) = width {
+                        tm.0 += w;
+                    }
                 }
             }
             "TJ" => {
                 if let Some(Object::Array(items)) = op.operands.first() {
+                    let st = AdvanceState { font_size, char_spacing: char_sp, word_spacing: word_sp, h_scale };
+                    // Track the advance across items so each string gets its
+                    // real start x; falls back to the TJ's start when a width
+                    // is unknowable.
+                    let mut acc: Option<f32> = Some(0.0);
                     for (tj_item, item) in items.iter().enumerate() {
-                        if let Object::String(bytes, _) = item {
-                            let (text, editable) = decode(&font_res, bytes);
-                            runs.push(TextRun {
-                                op_index,
-                                tj_item: Some(tj_item),
-                                font_res: font_res.clone(),
-                                font_size,
-                                x: tm.0,
-                                y: tm.1,
-                                text,
-                                editable,
-                            });
+                        match item {
+                            Object::String(bytes, _) => {
+                                let width = widths.get(&font_res).and_then(|gw| advance(gw, bytes, &st));
+                                let (text, editable) = decode(&font_res, bytes);
+                                runs.push(TextRun {
+                                    op_index,
+                                    tj_item: Some(tj_item),
+                                    font_res: font_res.clone(),
+                                    font_size,
+                                    x: tm.0 + acc.unwrap_or(0.0),
+                                    y: tm.1,
+                                    width,
+                                    text,
+                                    editable,
+                                });
+                                acc = match (acc, width) {
+                                    (Some(a), Some(w)) => Some(a + w),
+                                    _ => None,
+                                };
+                            }
+                            other => {
+                                if let Some(n) = num(other) {
+                                    acc = acc.map(|a| a + tj_number_advance(n, &st));
+                                }
+                            }
                         }
+                    }
+                    if let Some(a) = acc {
+                        tm.0 += a;
                     }
                 }
             }

@@ -9,7 +9,9 @@ use eframe::egui;
 use pdfaxe_core::lopdf::Document;
 use pdfaxe_core::render::render_page_rgba;
 use pdfaxe_core::text::{edit_run, text_runs, TextRun};
-use pdfaxe_core::{assemble, info, load, save, PageSel};
+use pdfaxe_core::{
+    assemble, info, load, page_numbers, parse_ranges, save, watermark, PageSel, StampOpts,
+};
 
 /// Thumbnail raster width, pixels.
 const THUMB_WIDTH: u32 = 150;
@@ -35,6 +37,8 @@ fn main() -> eframe::Result {
             let args: Vec<String> = std::env::args().skip(1).collect();
             app.dark = args.iter().any(|a| a == "--dark");
             app.edit_mode = args.iter().any(|a| a == "--edit");
+            app.wm_open = args.iter().any(|a| a == "--watermark");
+            app.pn_open = args.iter().any(|a| a == "--page-numbers");
             if let Some(path) = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from) {
                 if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
                     app.open_path(path);
@@ -86,6 +90,15 @@ impl OpenDoc {
             self.bytes = buf;
         }
     }
+
+    /// Drop every cached raster/run — for operations that touch many pages.
+    fn invalidate_all(&mut self) {
+        self.textures.clear();
+        self.thumbs.clear();
+        self.thumb_failed.clear();
+        self.render_errors.clear();
+        self.runs_cache.clear();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +129,19 @@ struct PdfaxeApp {
     /// Effective scale of fit-width as of the last frame — the anchor when
     /// stepping from Fit to an explicit zoom level.
     last_fit_zoom: f32,
+    // Watermark dialog state.
+    wm_open: bool,
+    wm_text: String,
+    wm_pages: String,
+    wm_size: f32,
+    wm_gray: f32,
+    wm_alpha: f32,
+    wm_angle: f32,
+    // Page-numbers dialog state.
+    pn_open: bool,
+    pn_template: String,
+    pn_size: f32,
+    pn_gray: f32,
 }
 
 impl Default for PdfaxeApp {
@@ -128,6 +154,17 @@ impl Default for PdfaxeApp {
             edit_mode: false,
             zoom: Zoom::FitWidth,
             last_fit_zoom: 1.0,
+            wm_open: false,
+            wm_text: "CONFIDENTIAL".into(),
+            wm_pages: String::new(),
+            wm_size: 48.0,
+            wm_gray: 0.6,
+            wm_alpha: 0.35,
+            wm_angle: 45.0,
+            pn_open: false,
+            pn_template: "{page} / {total}".into(),
+            pn_size: 10.0,
+            pn_gray: 0.35,
         }
     }
 }
@@ -247,6 +284,12 @@ impl eframe::App for PdfaxeApp {
                     if ui.selectable_label(self.edit_mode, label).clicked() {
                         self.edit_mode = !self.edit_mode;
                     }
+                    if ui.button("Watermark…").clicked() {
+                        self.wm_open = true;
+                    }
+                    if ui.button("Page numbers…").clicked() {
+                        self.pn_open = true;
+                    }
                     ui.separator();
                     let cur = match self.zoom {
                         Zoom::FitWidth => self.last_fit_zoom,
@@ -314,6 +357,102 @@ impl eframe::App for PdfaxeApp {
             });
             return;
         };
+
+        // ----- dialogs: watermark & page numbers -----
+        if self.wm_open {
+            let mut keep_open = true;
+            let mut apply = false;
+            egui::Window::new("Watermark")
+                .open(&mut keep_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    egui::Grid::new("wm_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Text");
+                        ui.text_edit_singleline(&mut self.wm_text);
+                        ui.end_row();
+                        ui.label("Pages");
+                        ui.add(egui::TextEdit::singleline(&mut self.wm_pages).hint_text("all — or e.g. 1-3,5"));
+                        ui.end_row();
+                    });
+                    ui.add_space(4.0);
+                    ui.add(egui::Slider::new(&mut self.wm_size, 12.0..=144.0).text("size (pt)"));
+                    ui.add(egui::Slider::new(&mut self.wm_angle, -90.0..=90.0).text("angle (°)"));
+                    ui.add(egui::Slider::new(&mut self.wm_alpha, 0.05..=1.0).text("opacity"));
+                    ui.add(egui::Slider::new(&mut self.wm_gray, 0.0..=1.0).text("gray"));
+                    ui.add_space(6.0);
+                    apply = ui.add(theme::primary_button("Stamp watermark")).clicked();
+                });
+            self.wm_open = keep_open;
+            if apply && !self.wm_text.trim().is_empty() {
+                let total = info(&open.doc).pages;
+                let pages: anyhow::Result<Vec<u32>> = if self.wm_pages.trim().is_empty() {
+                    Ok((1..=total).collect())
+                } else {
+                    parse_ranges(&self.wm_pages, total)
+                };
+                let opts = StampOpts {
+                    size: self.wm_size,
+                    gray: self.wm_gray,
+                    alpha: self.wm_alpha,
+                    angle: self.wm_angle,
+                };
+                let stamped = pages.and_then(|p| {
+                    watermark(&mut open.doc, &p, &self.wm_text, &opts)?;
+                    Ok(p.len())
+                });
+                match stamped {
+                    Ok(n) => {
+                        open.refresh_bytes();
+                        open.invalidate_all();
+                        open.edited = true;
+                        self.wm_open = false;
+                        self.status = format!("Watermarked {n} page(s)");
+                    }
+                    Err(e) => self.status = format!("Watermark failed: {e:#}"),
+                }
+            }
+        }
+        if self.pn_open {
+            let mut keep_open = true;
+            let mut apply = false;
+            egui::Window::new("Page numbers")
+                .open(&mut keep_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Format");
+                        ui.text_edit_singleline(&mut self.pn_template);
+                    });
+                    ui.label(
+                        egui::RichText::new("{page} = page number · {total} = page count")
+                            .color(pal.text_weak)
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(egui::Slider::new(&mut self.pn_size, 6.0..=24.0).text("size (pt)"));
+                    ui.add(egui::Slider::new(&mut self.pn_gray, 0.0..=1.0).text("gray"));
+                    ui.add_space(6.0);
+                    apply = ui.add(theme::primary_button("Stamp page numbers")).clicked();
+                });
+            self.pn_open = keep_open;
+            if apply && !self.pn_template.trim().is_empty() {
+                let opts = StampOpts { size: self.pn_size, gray: self.pn_gray, ..Default::default() };
+                match page_numbers(&mut open.doc, &self.pn_template, &opts) {
+                    Ok(n) => {
+                        open.refresh_bytes();
+                        open.invalidate_all();
+                        open.edited = true;
+                        self.pn_open = false;
+                        self.status = format!("Numbered {n} pages (bottom center)");
+                    }
+                    Err(e) => self.status = format!("Page numbers failed: {e:#}"),
+                }
+            }
+        }
 
         // Rasterize at most a couple of queued thumbnails per frame so large
         // documents never freeze the UI; the page list re-queues what's missing.
@@ -495,7 +634,7 @@ impl eframe::App for PdfaxeApp {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new("TEXT ON THIS PAGE").color(pal.text_weak).small().strong());
                     ui.label(
-                        egui::RichText::new("Same font, same position — reflow is the next milestone.")
+                        egui::RichText::new("Same font · the line reflows to fit. Paragraph re-wrap is on the roadmap.")
                             .color(pal.text_weak)
                             .small(),
                     );
@@ -656,7 +795,9 @@ impl eframe::App for PdfaxeApp {
                             if let Some(runs) = open.runs_cache.get(&page) {
                                 let mut best: Option<(usize, f32)> = None;
                                 for (i, run) in runs.iter().enumerate() {
-                                    let width_est = run.text.chars().count() as f32 * run.font_size * 0.55;
+                                    let width_est = run
+                                        .width
+                                        .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55);
                                     let within_x = px >= run.x - 4.0 && px <= run.x + width_est + 8.0;
                                     let dy = (py - run.y - run.font_size * 0.3).abs();
                                     if within_x && dy < run.font_size * 1.2 {
@@ -675,8 +816,10 @@ impl eframe::App for PdfaxeApp {
                         // Highlight the selected run on the page.
                         if let Some(ri) = open.selected_run {
                             if let Some(run) = open.runs_cache.get(&page).and_then(|r| r.get(ri)) {
-                                let width_est =
-                                    (run.text.chars().count() as f32 * run.font_size * 0.55).max(12.0);
+                                let width_est = run
+                                    .width
+                                    .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55)
+                                    .max(12.0);
                                 let h = run.font_size * 1.3;
                                 let min = egui::pos2(
                                     rect.min.x + run.x * s,

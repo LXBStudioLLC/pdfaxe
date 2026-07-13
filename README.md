@@ -66,8 +66,15 @@ cargo build --release --workspace    # optimized binaries
   output shows the new text at the exact position/font/color of the old
 - GUI launched + screenshot-verified: thumbnail page list (lazy, 2/frame budget), zoom
   controls (fit-width default, steps, Ctrl+scroll), edit-mode panel listing runs
+- Same-line reflow (July 13): an edit shifts the rest of its line by the real width
+  delta (glyph metrics from /Widths or built-in standard-14 AFM tables) and un-shifts
+  at the next line break; falls back to in-place when widths are unknown or the text
+  matrix is rotated. 27 core tests; render-verified via CLI edit-text + hayro.
+- Watermark + page-numbers GUI dialogs (July 13): screenshot-verified in both themes
+  via `--watermark` / `--page-numbers` deep-link flags; the engine calls beneath the
+  Apply buttons are the same test-covered watermark()/page_numbers() paths.
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
-  path underneath is test-covered)
+  path underneath is test-covered), dialog Apply buttons end-to-end
 
 ## Engine notes
 
@@ -83,14 +90,14 @@ cargo build --release --workspace    # optimized binaries
 
 1. **Text editing (the wedge, Phase 1):** ~~v1 shipped~~ — positioned runs, in-place
    same-font edits, find/replace, `/Encoding` names + `/Differences` + symbolic-font
-   protection (`pdfaxe-core/src/text.rs`). Next: reflow within a text block, then
-   font re-embedding for arbitrary new glyphs (shaping via `rustybuzz`, font
-   parsing/subsetting via `skrifa`/`klippa`).
-2. App: ~~thumbnails~~, ~~zoom~~ — remaining: multi-page continuous scroll viewport,
-   texture cache eviction for huge documents, watermark/page-number dialogs.
+   protection (`pdfaxe-core/src/text.rs`). ~~Same-line reflow~~ (`metrics.rs` +
+   `reflow_line`). Next: paragraph re-wrap across lines, then font re-embedding for
+   arbitrary new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
+   `skrifa`/`klippa`).
+2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~ — remaining:
+   multi-page continuous scroll viewport, texture cache eviction for huge documents.
 3. More ops at parity with the web suite: images→PDF, PDF→images (have `render`),
-   ~~watermark~~, ~~page numbers~~ (engine+CLI; GUI pending), redact (raster-burn,
-   engine already renders).
+   ~~watermark~~, ~~page numbers~~, redact (raster-burn, engine already renders).
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
    MSI packaging, file association + "Open with PDFAxe", icon, code signing.
 5. Windows polish: jump lists, recent files, dark mode following system.
