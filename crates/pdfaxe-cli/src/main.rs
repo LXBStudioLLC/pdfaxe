@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pdfaxe_core::ops::all_pages;
 use pdfaxe_core::{
-    assemble, extract_text, info, load, page_numbers, parse_ranges, rotate_pages, save,
-    watermark, PageSel, StampOpts,
+    assemble, extract_text, info, load, page_numbers, parse_ranges, redact_page, rotate_pages,
+    save, watermark, PageSel, RedactRect, StampOpts,
 };
 
 #[derive(Parser)]
@@ -110,6 +110,27 @@ enum Command {
         #[arg(long, default_value_t = 10.0)]
         size: f32,
     },
+    /// Redact by raster burn — the covered content is destroyed, not hidden
+    /// (the whole page becomes a bitmap; its text stops being selectable)
+    Redact {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(short, long)]
+        page: u32,
+        /// Box to burn, "x,y,w,h" in points, origin bottom-left (repeatable)
+        #[arg(long = "rect", value_name = "X,Y,W,H", required = true)]
+        rects: Vec<String>,
+        #[arg(long, default_value_t = 200.0)]
+        dpi: f32,
+    },
+}
+
+fn parse_rect(s: &str) -> Result<RedactRect> {
+    let parts: Vec<f32> = s.split(',').map(|p| p.trim().parse::<f32>()).collect::<Result<_, _>>()?;
+    anyhow::ensure!(parts.len() == 4, "--rect wants exactly x,y,w,h (got {s:?})");
+    anyhow::ensure!(parts[2] > 0.0 && parts[3] > 0.0, "--rect width/height must be positive");
+    Ok(RedactRect { x: parts[0], y: parts[1], w: parts[2], h: parts[3] })
 }
 
 fn main() -> Result<()> {
@@ -212,6 +233,17 @@ fn main() -> Result<()> {
             let total = page_numbers(&mut doc, &format, &opts)?;
             save(&mut doc, &out)?;
             println!("numbered {total} pages -> {}", out.display());
+        }
+        Command::Redact { input, out, page, rects, dpi } => {
+            let boxes: Vec<RedactRect> = rects.iter().map(|s| parse_rect(s)).collect::<Result<_>>()?;
+            let mut doc = load(&input)?;
+            redact_page(&mut doc, page, &boxes, dpi)?;
+            save(&mut doc, &out)?;
+            println!(
+                "burned {} box(es) out of page {page} -> {} (page is now a bitmap)",
+                boxes.len(),
+                out.display()
+            );
         }
     }
     Ok(())

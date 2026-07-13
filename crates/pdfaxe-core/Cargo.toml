@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.103"
+flate2 = "1.1"
 hayro = "0.7.1"
 lopdf = "0.44.0"
 png = "0.18.1"

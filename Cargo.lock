@@ -2882,6 +2882,7 @@ name = "pdfaxe-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "hayro",
  "lopdf",
  "png",

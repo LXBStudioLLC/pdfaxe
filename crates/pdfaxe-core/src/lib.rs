@@ -9,6 +9,7 @@
 pub(crate) mod metrics;
 pub mod ops;
 pub mod ranges;
+pub mod redact;
 pub mod render;
 pub mod stamp;
 pub mod text;
@@ -20,4 +21,5 @@ pub use ops::{
     assemble, extract_text, info, load, page_sizes, rotate_pages, save, DocInfo, PageSel,
 };
 pub use ranges::parse_ranges;
+pub use redact::{redact_page, RedactRect};
 pub use stamp::{page_numbers, watermark, StampOpts};

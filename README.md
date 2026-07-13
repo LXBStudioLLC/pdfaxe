@@ -48,6 +48,7 @@ cargo run -p pdfaxe-cli -- runs fixtures/sample-a.pdf          # positioned text
 cargo run -p pdfaxe-cli -- edit-text in.pdf -o out.pdf --find "old" --replace "new"
 cargo run -p pdfaxe-cli -- watermark in.pdf -o out.pdf --text "CONFIDENTIAL"
 cargo run -p pdfaxe-cli -- page-numbers in.pdf -o out.pdf --format "{page} / {total}"
+cargo run -p pdfaxe-cli -- redact in.pdf -o out.pdf --page 1 --rect "38,635,130,22"
 cargo run -p pdfaxe-app              # the app; also: pdfaxe-app.exe some.pdf ("Open with")
 cargo build --release --workspace    # optimized binaries
 ```
@@ -86,6 +87,11 @@ cargo build --release --workspace    # optimized binaries
   leading and near-full lines, so ragged line-lists (addresses) refuse and fall
   back to same-line reflow. Render-verified: a 40-char-longer replacement wraps
   onto the next line instead of overflowing the margin.
+- Redaction by raster burn (July 13): the page is re-rendered with the boxes
+  burned black and its content replaced by that bitmap — extract_text on the
+  redacted page returns nothing, other pages untouched, annotations dropped;
+  CLI + render verified (black box exactly over SECRET-CODE-42, ~56 KB page at
+  200 dpi).
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -112,7 +118,8 @@ cargo build --release --workspace    # optimized binaries
    continuous scroll + texture eviction~~ — remaining: keyboard navigation,
    search-in-document.
 3. More ops at parity with the web suite: images→PDF, PDF→images (have `render`),
-   ~~watermark~~, ~~page numbers~~, redact (raster-burn, engine already renders).
+   ~~watermark~~, ~~page numbers~~, ~~redact~~ (engine+CLI; GUI box-drawing
+   pending).
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
    MSI packaging, file association + "Open with PDFAxe", icon, code signing.
 5. Windows polish: jump lists, recent files, dark mode following system.
