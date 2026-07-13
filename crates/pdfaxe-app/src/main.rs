@@ -55,6 +55,13 @@ fn main() -> eframe::Result {
                     }
                 }
             }
+            if let Some(ix) = args.iter().position(|a| a == "--find") {
+                if let Some(q) = args.get(ix + 1) {
+                    app.search_query = q.clone();
+                    app.run_search();
+                    app.jump_to_hit();
+                }
+            }
             Ok(Box::new(app))
         }),
     )
@@ -63,6 +70,16 @@ fn main() -> eframe::Result {
 struct Row {
     src_page: u32,
     rotation: i64,
+}
+
+struct SearchHit {
+    page: u32,
+    run: usize,
+    preview: String,
+}
+
+fn search_box_id() -> egui::Id {
+    egui::Id::new("pdfaxe-search")
 }
 
 struct OpenDoc {
@@ -149,6 +166,9 @@ struct PdfaxeApp {
     last_fit_zoom: f32,
     /// Selection as of the last frame — the page list scrolls to follow changes.
     last_selected: Option<usize>,
+    search_query: String,
+    search_results: Vec<SearchHit>,
+    search_pos: usize,
     // Watermark dialog state.
     wm_open: bool,
     wm_text: String,
@@ -176,6 +196,9 @@ impl Default for PdfaxeApp {
             zoom: Zoom::FitWidth,
             last_fit_zoom: 1.0,
             last_selected: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_pos: 0,
             wm_open: false,
             wm_text: "CONFIDENTIAL".into(),
             wm_pages: String::new(),
@@ -235,6 +258,54 @@ impl PdfaxeApp {
             }
             Err(e) => self.status = format!("Couldn't open: {e:#}"),
         }
+    }
+
+    /// Case-insensitive search across every page's text runs.
+    fn run_search(&mut self) {
+        self.search_results.clear();
+        self.search_pos = 0;
+        let Some(open) = &mut self.open else { return };
+        let q = self.search_query.trim().to_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        for p in 1..=info(&open.doc).pages {
+            if !open.runs_cache.contains_key(&p) {
+                let runs = text_runs(&open.doc, p).unwrap_or_default();
+                open.runs_cache.insert(p, runs);
+            }
+            let Some(runs) = open.runs_cache.get(&p) else { continue };
+            for (i, run) in runs.iter().enumerate() {
+                if run.text.to_lowercase().contains(&q) {
+                    let mut preview = run.text.trim().to_owned();
+                    if preview.len() > 48 {
+                        preview.truncate(48);
+                        preview.push('…');
+                    }
+                    self.search_results.push(SearchHit { page: p, run: i, preview });
+                }
+            }
+        }
+        self.status = match self.search_results.len() {
+            0 => format!("No matches for {:?}", self.search_query.trim()),
+            n => format!("{n} match(es) for {:?}", self.search_query.trim()),
+        };
+    }
+
+    /// Scroll to and highlight the current search hit.
+    fn jump_to_hit(&mut self) {
+        let Some(open) = &mut self.open else { return };
+        let Some(hit) = self.search_results.get(self.search_pos) else { return };
+        let Some(row) = open.rows.iter().position(|r| r.src_page == hit.page) else { return };
+        open.selected = row;
+        open.scroll_to = Some(row);
+        open.selected_run = Some(hit.run);
+        open.edit_buffer = open
+            .runs_cache
+            .get(&hit.page)
+            .and_then(|r| r.get(hit.run))
+            .map(|r| r.text.clone())
+            .unwrap_or_default();
     }
 
     /// Build a PDF from dropped image files and open it, unsaved.
@@ -322,6 +393,11 @@ impl eframe::App for PdfaxeApp {
             } else if let Some(path) = dropped.into_iter().find(|p| ext_is(p, &["pdf"])) {
                 self.open_path(path);
             }
+        }
+
+        // Ctrl+F focuses the search box.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+            ctx.memory_mut(|m| m.request_focus(search_box_id()));
         }
 
         // Keyboard page navigation (when no text box has focus).
@@ -414,6 +490,33 @@ impl eframe::App for PdfaxeApp {
                     }
                     if ui.small_button("+").on_hover_text("Zoom in (or Ctrl+scroll)").clicked() {
                         self.zoom = Zoom::Scale(zoom_in(cur));
+                    }
+                    ui.separator();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .id(search_box_id())
+                            .desired_width(150.0)
+                            .hint_text("Find… (Ctrl+F)"),
+                    );
+                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.run_search();
+                        self.jump_to_hit();
+                    }
+                    if !self.search_results.is_empty() {
+                        let n = self.search_results.len();
+                        if ui.small_button("◀").on_hover_text("Previous match").clicked() {
+                            self.search_pos = (self.search_pos + n - 1) % n;
+                            self.jump_to_hit();
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{}/{n}", self.search_pos + 1))
+                                .color(pal.text_weak)
+                                .small(),
+                        );
+                        if ui.small_button("▶").on_hover_text("Next match").clicked() {
+                            self.search_pos = (self.search_pos + 1) % n;
+                            self.jump_to_hit();
+                        }
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1052,9 +1155,10 @@ impl eframe::App for PdfaxeApp {
                                     }
                                 }
                             }
+                        }
 
-                            // Highlight the selected run on its page.
-                            if i == open.selected {
+                        // Highlight the selected run (text edit or search jump).
+                        if i == open.selected {
                                 if let Some(ri) = open.selected_run {
                                     if let Some(run) = open.runs_cache.get(&pg).and_then(|r| r.get(ri)) {
                                         let width_est = run
@@ -1079,7 +1183,6 @@ impl eframe::App for PdfaxeApp {
                                     }
                                 }
                             }
-                        }
 
                         // Drag boxes to redact; committed boxes preview in black.
                         if self.redact_mode {

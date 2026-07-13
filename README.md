@@ -30,8 +30,9 @@ crates/pdfaxe-app    the Windows GUI (open/drop a PDF — or drop images to buil
                      thumbnail page list with reorder/rotate/delete, continuous
                      multi-page scroll view with zoom + PgUp/PgDn/Home/End, text-edit
                      mode with click-on-page selection, redact mode with drag-to-box
-                     burning, watermark + page-number dialogs, save-as; flags: --dark
-                     --edit --redact --watermark --page-numbers --page N)
+                     burning, in-document search (Ctrl+F) with match stepping,
+                     watermark + page-number dialogs, save-as; flags: --dark --edit
+                     --redact --watermark --page-numbers --page N --find TEXT)
 fixtures/            test PDFs (regenerate via ../app/scripts/make-samples.mjs)
 ```
 
@@ -104,6 +105,10 @@ cargo build --release --workspace    # optimized binaries
   redact_page), dropping PNG/JPEG files builds and opens a fresh PDF,
   PgUp/PgDn/Home/End navigate pages. Mode UI screenshot-verified via
   `--redact`; the drag gesture and drop gesture still need a human hand.
+- In-document search (July 13): Ctrl+F box in the top bar, case-insensitive
+  across all pages' runs, ◀ ▶ match stepping, each jump scrolls to the page
+  and highlights the run. Screenshot-verified via `--find SECRET` (counter
+  1/5, highlight box on the match).
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -126,9 +131,9 @@ cargo build --release --workspace    # optimized binaries
    detection, strings-only redistribution). Next: font re-embedding for arbitrary
    new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
    `skrifa`/`klippa`), then cross-block re-wrap (new-line creation).
-2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~, ~~multi-page
-   continuous scroll + texture eviction~~, ~~keyboard navigation~~, ~~redact
-   box-drawing~~, ~~image drop zone~~ — remaining: search-in-document.
+2. ~~App~~: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~,
+   ~~multi-page continuous scroll + texture eviction~~, ~~keyboard navigation~~,
+   ~~redact box-drawing~~, ~~image drop zone~~, ~~search-in-document~~ — done.
 3. ~~More ops at parity with the web suite~~: ~~images→PDF~~, ~~PDF→images~~,
    ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine, CLI and GUI all done.
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
