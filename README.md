@@ -26,11 +26,12 @@ crates/pdfaxe-core   engine: assemble() (merge/extract/reorder/rotate in one pri
                      stamp (watermark, page numbers — q…Q-sandwiched appends)
 crates/pdfaxe-cli    pdfaxe info|merge|extract|rotate|text|render|runs|edit-text|
                      watermark|page-numbers
-crates/pdfaxe-app    the Windows GUI (open/drop a PDF, thumbnail page list with
-                     reorder/rotate/delete, continuous multi-page scroll view with
-                     zoom, text-edit mode with click-on-page selection, watermark +
-                     page-number dialogs, save-as; flags: --dark --edit --watermark
-                     --page-numbers --page N)
+crates/pdfaxe-app    the Windows GUI (open/drop a PDF — or drop images to build one,
+                     thumbnail page list with reorder/rotate/delete, continuous
+                     multi-page scroll view with zoom + PgUp/PgDn/Home/End, text-edit
+                     mode with click-on-page selection, redact mode with drag-to-box
+                     burning, watermark + page-number dialogs, save-as; flags: --dark
+                     --edit --redact --watermark --page-numbers --page N)
 fixtures/            test PDFs (regenerate via ../app/scripts/make-samples.mjs)
 ```
 
@@ -98,6 +99,11 @@ cargo build --release --workspace    # optimized binaries
   as-is via DCTDecode — lossless; PNG re-encoded Flate RGB, alpha over white),
   `render --pages "1-3"` exports numbered PNGs; round-trip verified (PDF →
   PNGs → PDF → faithful render).
+- GUI redact mode + image drop zone + keyboard nav (July 13): drag boxes on
+  any page (live preview, per-box remove, burn button drives the test-covered
+  redact_page), dropping PNG/JPEG files builds and opens a fresh PDF,
+  PgUp/PgDn/Home/End navigate pages. Mode UI screenshot-verified via
+  `--redact`; the drag gesture and drop gesture still need a human hand.
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -121,11 +127,10 @@ cargo build --release --workspace    # optimized binaries
    new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
    `skrifa`/`klippa`), then cross-block re-wrap (new-line creation).
 2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~, ~~multi-page
-   continuous scroll + texture eviction~~ — remaining: keyboard navigation,
-   search-in-document.
+   continuous scroll + texture eviction~~, ~~keyboard navigation~~, ~~redact
+   box-drawing~~, ~~image drop zone~~ — remaining: search-in-document.
 3. ~~More ops at parity with the web suite~~: ~~images→PDF~~, ~~PDF→images~~,
-   ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine+CLI all done; GUI
-   surfaces pending for redact (box drawing) and images→PDF (drop zone).
+   ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine, CLI and GUI all done.
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
    MSI packaging, file association + "Open with PDFAxe", icon, code signing.
 5. Windows polish: jump lists, recent files, dark mode following system.

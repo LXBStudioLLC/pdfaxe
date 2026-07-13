@@ -10,7 +10,8 @@ use pdfaxe_core::lopdf::Document;
 use pdfaxe_core::render::render_page_rgba;
 use pdfaxe_core::text::{edit_run, text_runs, TextRun};
 use pdfaxe_core::{
-    assemble, info, load, page_numbers, parse_ranges, save, watermark, PageSel, StampOpts,
+    assemble, images_to_pdf, info, load, page_numbers, parse_ranges, redact_page, save,
+    watermark, PageSel, RedactRect, StampOpts,
 };
 
 /// Thumbnail raster width, pixels.
@@ -37,6 +38,7 @@ fn main() -> eframe::Result {
             let args: Vec<String> = std::env::args().skip(1).collect();
             app.dark = args.iter().any(|a| a == "--dark");
             app.edit_mode = args.iter().any(|a| a == "--edit");
+            app.redact_mode = args.iter().any(|a| a == "--redact");
             app.wm_open = args.iter().any(|a| a == "--watermark");
             app.pn_open = args.iter().any(|a| a == "--page-numbers");
             if let Some(path) = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from) {
@@ -84,6 +86,10 @@ struct OpenDoc {
     edited: bool,
     /// Row the view should scroll to (set by thumbnail clicks, one frame).
     scroll_to: Option<usize>,
+    /// Pending redaction boxes: (src page, box in page points).
+    redact_boxes: Vec<(u32, RedactRect)>,
+    /// In-progress box drag: (src page, start point in page points).
+    redact_drag: Option<(u32, (f32, f32))>,
 }
 
 impl OpenDoc {
@@ -136,6 +142,7 @@ struct PdfaxeApp {
     dark: bool,
     theme_applied: Option<bool>,
     edit_mode: bool,
+    redact_mode: bool,
     zoom: Zoom,
     /// Effective scale of fit-width as of the last frame — the anchor when
     /// stepping from Fit to an explicit zoom level.
@@ -165,6 +172,7 @@ impl Default for PdfaxeApp {
             dark: false,
             theme_applied: None,
             edit_mode: false,
+            redact_mode: false,
             zoom: Zoom::FitWidth,
             last_fit_zoom: 1.0,
             last_selected: None,
@@ -184,6 +192,37 @@ impl Default for PdfaxeApp {
 }
 
 impl PdfaxeApp {
+    fn install_doc(&mut self, path: PathBuf, doc: Document, bytes: Vec<u8>) {
+        let pages = info(&doc).pages;
+        // MediaBox dims up front so the scroll layout is stable before any
+        // page has rendered.
+        let page_points: HashMap<u32, (f32, f32)> = pdfaxe_core::page_sizes(&doc)
+            .into_iter()
+            .enumerate()
+            .map(|(i, wh)| (i as u32 + 1, wh))
+            .collect();
+        self.open = Some(OpenDoc {
+            path,
+            bytes,
+            doc,
+            rows: (1..=pages).map(|p| Row { src_page: p, rotation: 0 }).collect(),
+            selected: 0,
+            textures: HashMap::new(),
+            thumbs: HashMap::new(),
+            thumb_wants: Vec::new(),
+            thumb_failed: HashSet::new(),
+            page_points,
+            render_errors: HashMap::new(),
+            runs_cache: HashMap::new(),
+            selected_run: None,
+            edit_buffer: String::new(),
+            edited: false,
+            scroll_to: None,
+            redact_boxes: Vec::new(),
+            redact_drag: None,
+        });
+    }
+
     fn open_path(&mut self, path: PathBuf) {
         let loaded = load(&path).and_then(|doc| {
             let bytes = std::fs::read(&path)?;
@@ -191,35 +230,30 @@ impl PdfaxeApp {
         });
         match loaded {
             Ok((doc, bytes)) => {
-                let pages = info(&doc).pages;
-                // MediaBox dims up front so the scroll layout is stable before
-                // any page has rendered.
-                let page_points: HashMap<u32, (f32, f32)> = pdfaxe_core::page_sizes(&doc)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, wh)| (i as u32 + 1, wh))
-                    .collect();
-                self.status = format!("Opened {} ({pages} pages)", path.display());
-                self.open = Some(OpenDoc {
-                    path,
-                    bytes,
-                    doc,
-                    rows: (1..=pages).map(|p| Row { src_page: p, rotation: 0 }).collect(),
-                    selected: 0,
-                    textures: HashMap::new(),
-                    thumbs: HashMap::new(),
-                    thumb_wants: Vec::new(),
-                    thumb_failed: HashSet::new(),
-                    page_points,
-                    render_errors: HashMap::new(),
-                    runs_cache: HashMap::new(),
-                    selected_run: None,
-                    edit_buffer: String::new(),
-                    edited: false,
-                    scroll_to: None,
-                });
+                self.status = format!("Opened {} ({} pages)", path.display(), info(&doc).pages);
+                self.install_doc(path, doc, bytes);
             }
             Err(e) => self.status = format!("Couldn't open: {e:#}"),
+        }
+    }
+
+    /// Build a PDF from dropped image files and open it, unsaved.
+    fn open_images(&mut self, imgs: &[PathBuf]) {
+        let built = images_to_pdf(imgs).and_then(|mut doc| {
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes)?;
+            Ok((doc, bytes))
+        });
+        match built {
+            Ok((doc, bytes)) => {
+                self.status = format!(
+                    "Built a {}-page PDF from {} image(s) — Save as… to keep it",
+                    info(&doc).pages,
+                    imgs.len()
+                );
+                self.install_doc(PathBuf::from("images.pdf"), doc, bytes);
+            }
+            Err(e) => self.status = format!("Couldn't build PDF from images: {e:#}"),
         }
     }
 
@@ -272,17 +306,54 @@ impl eframe::App for PdfaxeApp {
         }
         let pal = theme::palette(self.dark);
 
-        // Drag & drop a PDF anywhere onto the window.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")))
-                .collect()
-        });
-        if let Some(path) = dropped.into_iter().next() {
-            self.open_path(path);
+        // Drag & drop anywhere: a PDF opens; images become a fresh PDF.
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if !dropped.is_empty() {
+            let ext_is = |p: &PathBuf, wanted: &[&str]| {
+                p.extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .is_some_and(|e| wanted.contains(&e.as_str()))
+            };
+            let imgs: Vec<PathBuf> =
+                dropped.iter().filter(|p| ext_is(p, &["png", "jpg", "jpeg"])).cloned().collect();
+            if !imgs.is_empty() {
+                self.open_images(&imgs);
+            } else if let Some(path) = dropped.into_iter().find(|p| ext_is(p, &["pdf"])) {
+                self.open_path(path);
+            }
+        }
+
+        // Keyboard page navigation (when no text box has focus).
+        if !ctx.egui_wants_keyboard_input() {
+            if let Some(open) = &mut self.open {
+                if !open.rows.is_empty() {
+                    let (pgdn, pgup, home, end) = ctx.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::PageDown),
+                            i.key_pressed(egui::Key::PageUp),
+                            i.key_pressed(egui::Key::Home),
+                            i.key_pressed(egui::Key::End),
+                        )
+                    });
+                    let last = open.rows.len() - 1;
+                    let target = if pgdn {
+                        Some((open.selected + 1).min(last))
+                    } else if pgup {
+                        Some(open.selected.saturating_sub(1))
+                    } else if home {
+                        Some(0)
+                    } else if end {
+                        Some(last)
+                    } else {
+                        None
+                    };
+                    if let Some(t) = target {
+                        open.selected = t;
+                        open.scroll_to = Some(t);
+                    }
+                }
+            }
         }
 
         let card_frame = egui::Frame::new()
@@ -305,6 +376,16 @@ impl eframe::App for PdfaxeApp {
                     let label = if self.edit_mode { "✏ Editing text" } else { "Edit text" };
                     if ui.selectable_label(self.edit_mode, label).clicked() {
                         self.edit_mode = !self.edit_mode;
+                        if self.edit_mode {
+                            self.redact_mode = false;
+                        }
+                    }
+                    let rlabel = if self.redact_mode { "▮ Redacting" } else { "Redact" };
+                    if ui.selectable_label(self.redact_mode, rlabel).clicked() {
+                        self.redact_mode = !self.redact_mode;
+                        if self.redact_mode {
+                            self.edit_mode = false;
+                        }
                     }
                     if ui.button("Watermark…").clicked() {
                         self.wm_open = true;
@@ -739,6 +820,76 @@ impl eframe::App for PdfaxeApp {
             }
         }
 
+        // ----- right: redact boxes -----
+        let mut burn_clicked = false;
+        if self.redact_mode {
+            egui::Panel::right("redact")
+                .resizable(true)
+                .default_size(260.0)
+                .frame(card_frame)
+                .show(ui, |ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("REDACT").color(pal.text_weak).small().strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Drag boxes over content on the page. Burning re-renders those pages \
+                             as bitmaps — the covered content is destroyed, not hidden (and the \
+                             page's text stops being selectable).",
+                        )
+                        .color(pal.text_weak)
+                        .small(),
+                    );
+                    ui.add_space(6.0);
+                    let mut remove: Option<usize> = None;
+                    for (i, (p, r)) in open.redact_boxes.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("page {p} · {:.0}×{:.0} pt", r.w, r.h));
+                            if ui.small_button("X").on_hover_text("Remove this box").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        open.redact_boxes.remove(i);
+                    }
+                    if open.redact_boxes.is_empty() {
+                        ui.label(egui::RichText::new("(no boxes yet — drag on the page)").color(pal.text_weak));
+                    } else {
+                        ui.add_space(8.0);
+                        let label = format!("Burn {} box(es)", open.redact_boxes.len());
+                        burn_clicked = ui.add(theme::primary_button(&label)).clicked();
+                        if ui.button("Clear all").clicked() {
+                            open.redact_boxes.clear();
+                        }
+                    }
+                });
+        }
+        if burn_clicked && !open.redact_boxes.is_empty() {
+            let mut by_page: HashMap<u32, Vec<RedactRect>> = HashMap::new();
+            for (p, r) in open.redact_boxes.drain(..) {
+                by_page.entry(p).or_default().push(r);
+            }
+            let mut result = Ok(());
+            for (p, rects) in &by_page {
+                if let Err(e) = redact_page(&mut open.doc, *p, rects, 200.0) {
+                    result = Err(e);
+                    break;
+                }
+            }
+            match result {
+                Ok(()) => {
+                    open.refresh_bytes();
+                    open.invalidate_all();
+                    open.edited = true;
+                    self.status = format!(
+                        "Burned boxes on {} page(s) — those pages are bitmaps now",
+                        by_page.len()
+                    );
+                }
+                Err(e) => self.status = format!("Redact failed: {e:#}"),
+            }
+        }
+
         // ----- center: continuous scroll over every page -----
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             let file_name = open
@@ -798,7 +949,8 @@ impl eframe::App for PdfaxeApp {
                             Zoom::Scale(z) => pw * z,
                         };
                         let size = egui::vec2(display_w, display_w * ph / pw.max(1.0));
-                        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                        let (rect, response) =
+                            ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
                         if scroll_to == Some(i) {
                             ui.scroll_to_rect(rect, Some(egui::Align::Min));
@@ -925,6 +1077,69 @@ impl eframe::App for PdfaxeApp {
                                             egui::StrokeKind::Outside,
                                         );
                                     }
+                                }
+                            }
+                        }
+
+                        // Drag boxes to redact; committed boxes preview in black.
+                        if self.redact_mode {
+                            let to_page =
+                                |pos: egui::Pos2| ((pos.x - rect.min.x) / s, ph - (pos.y - rect.min.y) / s);
+                            if response.drag_started() {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    open.redact_drag = Some((pg, to_page(pos)));
+                                }
+                            }
+                            if let Some((dpg, start)) = open.redact_drag {
+                                if dpg == pg {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let cur = to_page(pos);
+                                        let (x0, x1) = (start.0.min(cur.0), start.0.max(cur.0));
+                                        let (y0, y1) = (start.1.min(cur.1), start.1.max(cur.1));
+                                        let scr = egui::Rect::from_min_size(
+                                            egui::pos2(rect.min.x + x0 * s, rect.min.y + (ph - y1) * s),
+                                            egui::vec2((x1 - x0) * s, (y1 - y0) * s),
+                                        );
+                                        ui.painter().rect_filled(
+                                            scr,
+                                            0.0,
+                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                                        );
+                                        ui.painter().rect_stroke(
+                                            scr,
+                                            0.0,
+                                            egui::Stroke::new(1.5, egui::Color32::RED),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                        if response.drag_stopped() {
+                                            if x1 - x0 > 2.0 && y1 - y0 > 2.0 {
+                                                open.redact_boxes.push((
+                                                    pg,
+                                                    RedactRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+                                                ));
+                                            }
+                                            open.redact_drag = None;
+                                        }
+                                    }
+                                }
+                            }
+                            for (bp, r) in &open.redact_boxes {
+                                if *bp == pg {
+                                    let scr = egui::Rect::from_min_size(
+                                        egui::pos2(rect.min.x + r.x * s, rect.min.y + (ph - r.y - r.h) * s),
+                                        egui::vec2(r.w * s, r.h * s),
+                                    );
+                                    ui.painter().rect_filled(
+                                        scr,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        scr,
+                                        0.0,
+                                        egui::Stroke::new(1.0, egui::Color32::RED),
+                                        egui::StrokeKind::Outside,
+                                    );
                                 }
                             }
                         }
