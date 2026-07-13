@@ -49,6 +49,54 @@ pub fn extract_text(doc: &Document, page: u32) -> Result<String> {
     doc.extract_text(&[page]).map_err(|e| anyhow!("text extraction failed: {e}"))
 }
 
+/// MediaBox of a page as (x0, y0, x1, y1); the US-Letter default when absent.
+pub fn page_media_box(doc: &Document, page_id: ObjectId) -> (f32, f32, f32, f32) {
+    fn num(o: &Object) -> Option<f32> {
+        match o {
+            Object::Integer(i) => Some(*i as f32),
+            Object::Real(r) => Some(*r as f32),
+            _ => None,
+        }
+    }
+    let nums: Vec<f32> = resolve_inherited(doc, page_id, b"MediaBox")
+        .and_then(|o| match o {
+            Object::Array(a) => Some(a),
+            Object::Reference(id) => match doc.get_object(id) {
+                Ok(Object::Array(a)) => Some(a.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|a| a.iter().filter_map(num).collect())
+        .unwrap_or_default();
+    if nums.len() == 4 {
+        (nums[0], nums[1], nums[2], nums[3])
+    } else {
+        (0.0, 0.0, 612.0, 792.0)
+    }
+}
+
+/// Display size (width, height) in points of every page in order, honoring
+/// the page's /Rotate — cheap layout data, no rendering involved.
+pub fn page_sizes(doc: &Document) -> Vec<(f32, f32)> {
+    doc.get_pages()
+        .values()
+        .map(|&id| {
+            let (x0, y0, x1, y1) = page_media_box(doc, id);
+            let (w, h) = ((x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0));
+            let rot = resolve_inherited(doc, id, b"Rotate")
+                .and_then(|o| match o {
+                    Object::Integer(i) => Some(i),
+                    Object::Reference(r) => doc.get_object(r).ok().and_then(|x| x.as_i64().ok()),
+                    _ => None,
+                })
+                .unwrap_or(0)
+                .rem_euclid(360);
+            if rot == 90 || rot == 270 { (h, w) } else { (w, h) }
+        })
+        .collect()
+}
+
 /// Look up a possibly-inherited page attribute by walking the Parent chain.
 fn inherited(objects: &BTreeMap<ObjectId, Object>, page_id: ObjectId, key: &[u8]) -> Option<Object> {
     let mut current = Some(page_id);
@@ -274,5 +322,13 @@ mod tests {
         let i = info(&a);
         assert_eq!(i.pages, 5);
         assert!(!i.encrypted);
+    }
+
+    #[test]
+    fn page_sizes_reads_mediaboxes() {
+        let a = load(fixture("sample-a.pdf")).unwrap();
+        let sizes = page_sizes(&a);
+        assert_eq!(sizes.len(), 5);
+        assert!(sizes.iter().all(|&(w, h)| w > 100.0 && h > w), "portrait pages expected: {sizes:?}");
     }
 }

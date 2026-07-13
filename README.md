@@ -27,8 +27,10 @@ crates/pdfaxe-core   engine: assemble() (merge/extract/reorder/rotate in one pri
 crates/pdfaxe-cli    pdfaxe info|merge|extract|rotate|text|render|runs|edit-text|
                      watermark|page-numbers
 crates/pdfaxe-app    the Windows GUI (open/drop a PDF, thumbnail page list with
-                     reorder/rotate/delete, zoomable rendered view, text-edit mode
-                     with click-on-page selection, save-as; flags: --dark --edit)
+                     reorder/rotate/delete, continuous multi-page scroll view with
+                     zoom, text-edit mode with click-on-page selection, watermark +
+                     page-number dialogs, save-as; flags: --dark --edit --watermark
+                     --page-numbers --page N)
 fixtures/            test PDFs (regenerate via ../app/scripts/make-samples.mjs)
 ```
 
@@ -73,6 +75,11 @@ cargo build --release --workspace    # optimized binaries
 - Watermark + page-numbers GUI dialogs (July 13): screenshot-verified in both themes
   via `--watermark` / `--page-numbers` deep-link flags; the engine calls beneath the
   Apply buttons are the same test-covered watermark()/page_numbers() paths.
+- Continuous multi-page scroll (July 13): all pages in one scroll viewport, layout
+  pre-sized from MediaBoxes (`page_sizes()`), 1 rasterization/frame budget, textures
+  evicted outside a viewport-height band, page list follows scroll and vice versa;
+  screenshot-verified via `--page 4` deep-link (viewport and thumbnail both land on
+  page 4).
 - Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
   path underneath is test-covered), dialog Apply buttons end-to-end
 
@@ -94,8 +101,9 @@ cargo build --release --workspace    # optimized binaries
    `reflow_line`). Next: paragraph re-wrap across lines, then font re-embedding for
    arbitrary new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
    `skrifa`/`klippa`).
-2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~ — remaining:
-   multi-page continuous scroll viewport, texture cache eviction for huge documents.
+2. App: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~, ~~multi-page
+   continuous scroll + texture eviction~~ — remaining: keyboard navigation,
+   search-in-document.
 3. More ops at parity with the web suite: images→PDF, PDF→images (have `render`),
    ~~watermark~~, ~~page numbers~~, redact (raster-burn, engine already renders).
 4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`

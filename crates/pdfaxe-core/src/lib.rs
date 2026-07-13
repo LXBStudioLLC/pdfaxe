@@ -16,6 +16,8 @@ pub mod text;
 /// Re-exported so downstream crates use the same lopdf version as the core.
 pub use lopdf;
 
-pub use ops::{assemble, extract_text, info, load, rotate_pages, save, DocInfo, PageSel};
+pub use ops::{
+    assemble, extract_text, info, load, page_sizes, rotate_pages, save, DocInfo, PageSel,
+};
 pub use ranges::parse_ranges;
 pub use stamp::{page_numbers, watermark, StampOpts};

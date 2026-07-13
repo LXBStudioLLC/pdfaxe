@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
-use crate::ops::resolve_inherited;
+use crate::ops::{page_media_box, resolve_inherited};
 
 const STAMP_FONT_RES: &str = "PAXHelv";
 const STAMP_GS_RES: &str = "PAXGs";
@@ -137,33 +137,6 @@ fn ensure_stamp_resources(
         .map_err(|e| anyhow!("page dictionary unavailable: {e}"))?;
     page.set("Resources", Object::Dictionary(res));
     Ok(())
-}
-
-fn num(o: &Object) -> Option<f32> {
-    match o {
-        Object::Integer(i) => Some(*i as f32),
-        Object::Real(r) => Some(*r as f32),
-        _ => None,
-    }
-}
-
-fn page_media_box(doc: &Document, page_id: ObjectId) -> (f32, f32, f32, f32) {
-    let nums: Vec<f32> = resolve_inherited(doc, page_id, b"MediaBox")
-        .and_then(|o| match o {
-            Object::Array(a) => Some(a),
-            Object::Reference(id) => match doc.get_object(id) {
-                Ok(Object::Array(a)) => Some(a.clone()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .map(|a| a.iter().filter_map(num).collect())
-        .unwrap_or_default();
-    if nums.len() == 4 {
-        (nums[0], nums[1], nums[2], nums[3])
-    } else {
-        (0.0, 0.0, 612.0, 792.0)
-    }
 }
 
 /// Helvetica line width from the built-in standard-14 metrics.

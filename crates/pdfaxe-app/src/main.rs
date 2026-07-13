@@ -44,6 +44,15 @@ fn main() -> eframe::Result {
                     app.open_path(path);
                 }
             }
+            if let Some(ix) = args.iter().position(|a| a == "--page") {
+                if let Some(n) = args.get(ix + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    if let Some(open) = app.open.as_mut() {
+                        let i = n.saturating_sub(1).min(open.rows.len().saturating_sub(1));
+                        open.selected = i;
+                        open.scroll_to = Some(i);
+                    }
+                }
+            }
             Ok(Box::new(app))
         }),
     )
@@ -73,6 +82,8 @@ struct OpenDoc {
     selected_run: Option<usize>,
     edit_buffer: String,
     edited: bool,
+    /// Row the view should scroll to (set by thumbnail clicks, one frame).
+    scroll_to: Option<usize>,
 }
 
 impl OpenDoc {
@@ -129,6 +140,8 @@ struct PdfaxeApp {
     /// Effective scale of fit-width as of the last frame — the anchor when
     /// stepping from Fit to an explicit zoom level.
     last_fit_zoom: f32,
+    /// Selection as of the last frame — the page list scrolls to follow changes.
+    last_selected: Option<usize>,
     // Watermark dialog state.
     wm_open: bool,
     wm_text: String,
@@ -154,6 +167,7 @@ impl Default for PdfaxeApp {
             edit_mode: false,
             zoom: Zoom::FitWidth,
             last_fit_zoom: 1.0,
+            last_selected: None,
             wm_open: false,
             wm_text: "CONFIDENTIAL".into(),
             wm_pages: String::new(),
@@ -178,6 +192,13 @@ impl PdfaxeApp {
         match loaded {
             Ok((doc, bytes)) => {
                 let pages = info(&doc).pages;
+                // MediaBox dims up front so the scroll layout is stable before
+                // any page has rendered.
+                let page_points: HashMap<u32, (f32, f32)> = pdfaxe_core::page_sizes(&doc)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, wh)| (i as u32 + 1, wh))
+                    .collect();
                 self.status = format!("Opened {} ({pages} pages)", path.display());
                 self.open = Some(OpenDoc {
                     path,
@@ -189,12 +210,13 @@ impl PdfaxeApp {
                     thumbs: HashMap::new(),
                     thumb_wants: Vec::new(),
                     thumb_failed: HashSet::new(),
-                    page_points: HashMap::new(),
+                    page_points,
                     render_errors: HashMap::new(),
                     runs_cache: HashMap::new(),
                     selected_run: None,
                     edit_buffer: String::new(),
                     edited: false,
+                    scroll_to: None,
                 });
             }
             Err(e) => self.status = format!("Couldn't open: {e:#}"),
@@ -503,7 +525,7 @@ impl eframe::App for PdfaxeApp {
                             .fill(if is_sel { pal.selected_bg } else { egui::Color32::TRANSPARENT })
                             .corner_radius(egui::CornerRadius::same(6))
                             .inner_margin(egui::Margin::same(6));
-                        card.show(ui, |ui| {
+                        let card_resp = card.show(ui, |ui| {
                             let thumb_w = ui.available_width().clamp(40.0, 150.0);
                             let (pw, ph) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
                             let size = egui::vec2(thumb_w, thumb_w * ph / pw.max(1.0));
@@ -547,6 +569,7 @@ impl eframe::App for PdfaxeApp {
                             if clicked {
                                 open.selected = i;
                                 open.selected_run = None;
+                                open.scroll_to = Some(i);
                             }
                             let label = if row.rotation != 0 {
                                 format!("#{} · p{} · +{}° on save", i + 1, page, row.rotation)
@@ -573,6 +596,10 @@ impl eframe::App for PdfaxeApp {
                                 }
                             });
                         });
+                        // Follow selection changes (scroll tracking, --page).
+                        if is_sel && self.last_selected != Some(i) {
+                            ui.scroll_to_rect(card_resp.response.rect, Some(egui::Align::Center));
+                        }
                         ui.add_space(4.0);
                     }
                 });
@@ -712,7 +739,7 @@ impl eframe::App for PdfaxeApp {
             }
         }
 
-        // ----- center: rendered page -----
+        // ----- center: continuous scroll over every page -----
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             let file_name = open
                 .path
@@ -721,9 +748,10 @@ impl eframe::App for PdfaxeApp {
                 .unwrap_or_default();
             ui.label(
                 egui::RichText::new(format!(
-                    "{file_name}{} · PDF {} · page {page}",
+                    "{file_name}{} · PDF {} · {} pages · page {page}",
                     if open.edited { " (edited)" } else { "" },
                     info(&open.doc).version,
+                    open.rows.len(),
                 ))
                 .color(pal.text_weak)
                 .small(),
@@ -742,109 +770,181 @@ impl eframe::App for PdfaxeApp {
                 }
             }
 
-            let avail = ui.available_width().max(200.0);
-            let (pw_hint, _) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
-            let display_w_hint = match self.zoom {
-                Zoom::FitWidth => avail,
-                Zoom::Scale(z) => pw_hint * z,
-            };
-            let want_px = (((display_w_hint * ctx.pixels_per_point() / RENDER_STEP_PX).ceil()
-                * RENDER_STEP_PX) as u32)
-                .clamp(MIN_RENDER_PX, MAX_RENDER_PX);
-            let needs_render = open.textures.get(&page).is_none_or(|(_, w)| *w != want_px)
-                && !open.render_errors.contains_key(&page);
-            if needs_render {
-                match render_page_rgba(&open.bytes, page, want_px) {
-                    Ok(rendered) => {
-                        let image = egui::ColorImage::from_rgba_premultiplied(
-                            [rendered.width as usize, rendered.height as usize],
-                            &rendered.pixels,
-                        );
-                        let tex = ctx.load_texture(format!("page-{page}"), image, egui::TextureOptions::LINEAR);
-                        open.textures.insert(page, (tex, want_px));
-                        open.page_points.insert(page, (rendered.point_width, rendered.point_height));
-                    }
-                    Err(e) => {
-                        open.render_errors.insert(page, format!("{e:#}"));
-                    }
-                }
-            }
+            // Leave room for the vertical scrollbar so fit-width never
+            // triggers a horizontal one.
+            let avail = (ui.available_width() - 14.0).max(200.0);
+            let (pw_sel, _) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
+            self.last_fit_zoom = avail / pw_sel.max(1.0);
+
+            // At most one page rasterization per frame keeps scrolling fluid;
+            // pending pages request another frame.
+            let mut render_budget = 1usize;
+            let mut pending_render = false;
+            let mut keep_textures: HashSet<u32> = HashSet::new();
+            let mut topmost: Option<usize> = None;
+            let scroll_to = open.scroll_to.take();
 
             egui::ScrollArea::both().show(ui, |ui| {
-                if let Some((tex, _)) = open.textures.get(&page) {
-                    let (pw, ph) = open.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
-                    self.last_fit_zoom = avail / pw.max(1.0);
-                    let display_w = match self.zoom {
-                        Zoom::FitWidth => avail,
-                        Zoom::Scale(z) => pw * z,
-                    };
-                    let response = ui.add(
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(egui::vec2(display_w, display_w * ph / pw.max(1.0)))
-                            .corner_radius(3.0)
-                            .sense(egui::Sense::click()),
-                    );
-                    let rect = response.rect;
-                    let s = rect.width() / pw.max(1.0);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    let clip = ui.clip_rect();
+                    // Pre-render one viewport-height around the visible band.
+                    let near = clip.expand2(egui::vec2(0.0, clip.height().max(400.0)));
 
-                    // Click text on the page to select it for editing.
-                    if self.edit_mode {
-                        if let (true, Some(pos)) = (response.clicked(), response.interact_pointer_pos()) {
-                            let px = (pos.x - rect.min.x) / s;
-                            let py = ph - (pos.y - rect.min.y) / s;
-                            if let Some(runs) = open.runs_cache.get(&page) {
-                                let mut best: Option<(usize, f32)> = None;
-                                for (i, run) in runs.iter().enumerate() {
-                                    let width_est = run
-                                        .width
-                                        .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55);
-                                    let within_x = px >= run.x - 4.0 && px <= run.x + width_est + 8.0;
-                                    let dy = (py - run.y - run.font_size * 0.3).abs();
-                                    if within_x && dy < run.font_size * 1.2 {
-                                        if best.is_none_or(|(_, d)| dy < d) {
-                                            best = Some((i, dy));
-                                        }
+                    for i in 0..open.rows.len() {
+                        let pg = open.rows[i].src_page;
+                        let (pw, ph) = open.page_points.get(&pg).copied().unwrap_or((595.0, 842.0));
+                        let display_w = match self.zoom {
+                            Zoom::FitWidth => avail,
+                            Zoom::Scale(z) => pw * z,
+                        };
+                        let size = egui::vec2(display_w, display_w * ph / pw.max(1.0));
+                        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+                        if scroll_to == Some(i) {
+                            ui.scroll_to_rect(rect, Some(egui::Align::Min));
+                        }
+                        if topmost.is_none() && rect.bottom() > clip.top() + 4.0 {
+                            topmost = Some(i);
+                        }
+                        if !rect.intersects(near) {
+                            continue;
+                        }
+                        keep_textures.insert(pg);
+
+                        let want_px = (((display_w * ctx.pixels_per_point() / RENDER_STEP_PX).ceil()
+                            * RENDER_STEP_PX) as u32)
+                            .clamp(MIN_RENDER_PX, MAX_RENDER_PX);
+                        let has_current = open.textures.get(&pg).is_some_and(|(_, w)| *w == want_px);
+                        if !has_current && !open.render_errors.contains_key(&pg) {
+                            if render_budget > 0 {
+                                render_budget -= 1;
+                                match render_page_rgba(&open.bytes, pg, want_px) {
+                                    Ok(r) => {
+                                        let image = egui::ColorImage::from_rgba_premultiplied(
+                                            [r.width as usize, r.height as usize],
+                                            &r.pixels,
+                                        );
+                                        let tex = ctx.load_texture(
+                                            format!("page-{pg}"),
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        open.textures.insert(pg, (tex, want_px));
+                                        open.page_points.insert(pg, (r.point_width, r.point_height));
+                                    }
+                                    Err(e) => {
+                                        open.render_errors.insert(pg, format!("{e:#}"));
                                     }
                                 }
-                                if let Some((i, _)) = best {
-                                    open.selected_run = Some(i);
-                                    open.edit_buffer = runs[i].text.clone();
-                                }
+                            } else {
+                                pending_render = true;
                             }
                         }
 
-                        // Highlight the selected run on the page.
-                        if let Some(ri) = open.selected_run {
-                            if let Some(run) = open.runs_cache.get(&page).and_then(|r| r.get(ri)) {
-                                let width_est = run
-                                    .width
-                                    .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55)
-                                    .max(12.0);
-                                let h = run.font_size * 1.3;
-                                let min = egui::pos2(
-                                    rect.min.x + run.x * s,
-                                    rect.min.y + (ph - run.y - run.font_size) * s,
-                                );
-                                let hi_rect = egui::Rect::from_min_size(
-                                    min,
-                                    egui::vec2(width_est * s, h * s),
-                                );
-                                ui.painter().rect_stroke(
-                                    hi_rect,
-                                    2.0,
-                                    egui::Stroke::new(2.0, theme::AXE_ORANGE_BRIGHT),
-                                    egui::StrokeKind::Outside,
-                                );
+                        if let Some((tex, _)) = open.textures.get(&pg) {
+                            egui::Image::new(tex).corner_radius(3.0).paint_at(ui, rect);
+                        } else if let Some(err) = open.render_errors.get(&pg) {
+                            ui.painter().rect_filled(rect, 3.0, pal.page_bg);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                format!("Couldn't render p{pg}: {err}"),
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_rgb(0xB9, 0x1C, 0x1C),
+                            );
+                        } else {
+                            ui.painter().rect_filled(rect, 3.0, pal.page_bg);
+                            ui.painter().rect_stroke(
+                                rect,
+                                3.0,
+                                egui::Stroke::new(1.0, pal.border),
+                                egui::StrokeKind::Outside,
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                format!("page {pg}"),
+                                egui::FontId::proportional(12.0),
+                                pal.text_weak,
+                            );
+                        }
+
+                        // Click text on any page to select it for editing.
+                        let s = rect.width() / pw.max(1.0);
+                        if self.edit_mode {
+                            if let (true, Some(pos)) = (response.clicked(), response.interact_pointer_pos()) {
+                                let px = (pos.x - rect.min.x) / s;
+                                let py = ph - (pos.y - rect.min.y) / s;
+                                if !open.runs_cache.contains_key(&pg) {
+                                    let runs = text_runs(&open.doc, pg).unwrap_or_default();
+                                    open.runs_cache.insert(pg, runs);
+                                }
+                                if let Some(runs) = open.runs_cache.get(&pg) {
+                                    let mut best: Option<(usize, f32)> = None;
+                                    for (ri, run) in runs.iter().enumerate() {
+                                        let width_est = run
+                                            .width
+                                            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55);
+                                        let within_x = px >= run.x - 4.0 && px <= run.x + width_est + 8.0;
+                                        let dy = (py - run.y - run.font_size * 0.3).abs();
+                                        if within_x && dy < run.font_size * 1.2 {
+                                            if best.is_none_or(|(_, d)| dy < d) {
+                                                best = Some((ri, dy));
+                                            }
+                                        }
+                                    }
+                                    if let Some((ri, _)) = best {
+                                        open.selected = i;
+                                        open.selected_run = Some(ri);
+                                        open.edit_buffer = runs[ri].text.clone();
+                                    }
+                                }
+                            }
+
+                            // Highlight the selected run on its page.
+                            if i == open.selected {
+                                if let Some(ri) = open.selected_run {
+                                    if let Some(run) = open.runs_cache.get(&pg).and_then(|r| r.get(ri)) {
+                                        let width_est = run
+                                            .width
+                                            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55)
+                                            .max(12.0);
+                                        let h = run.font_size * 1.3;
+                                        let min = egui::pos2(
+                                            rect.min.x + run.x * s,
+                                            rect.min.y + (ph - run.y - run.font_size) * s,
+                                        );
+                                        let hi_rect = egui::Rect::from_min_size(
+                                            min,
+                                            egui::vec2(width_est * s, h * s),
+                                        );
+                                        ui.painter().rect_stroke(
+                                            hi_rect,
+                                            2.0,
+                                            egui::Stroke::new(2.0, theme::AXE_ORANGE_BRIGHT),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                } else if let Some(err) = open.render_errors.get(&page) {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xB9, 0x1C, 0x1C),
-                        format!("Couldn't render this page: {err}"),
-                    );
-                }
+                });
             });
+
+            // Free textures far from the viewport so huge documents stay lean.
+            open.textures.retain(|p, _| keep_textures.contains(p));
+            if pending_render {
+                ctx.request_repaint();
+            }
+            // Outside edit mode the page list follows the scroll position.
+            if scroll_to.is_none() && !self.edit_mode {
+                if let Some(t) = topmost {
+                    open.selected = t;
+                }
+            }
         });
+
+        self.last_selected = self.open.as_ref().map(|o| o.selected);
     }
 }
