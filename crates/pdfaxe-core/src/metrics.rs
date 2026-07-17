@@ -12,17 +12,16 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::ops::resolve_inherited;
 
-/// Per-byte-code glyph widths for one simple font, in 1/1000 text-space units.
-pub(crate) struct GlyphWidths {
-    by_code: [Option<f32>; 256],
-    /// /MissingWidth (or the family average for built-in tables).
-    missing: Option<f32>,
-}
-
-impl GlyphWidths {
-    fn code_width(&self, code: u8) -> Option<f32> {
-        self.by_code[code as usize].or(self.missing)
-    }
+/// Glyph widths for one font, in 1/1000 text-space units.
+pub(crate) enum GlyphWidths {
+    /// Single-byte simple font: per-code widths.
+    Simple {
+        by_code: Box<[Option<f32>; 256]>,
+        /// /MissingWidth (or the family average for built-in tables).
+        missing: Option<f32>,
+    },
+    /// Composite Identity-H font: 2-byte codes are CIDs, widths from /W.
+    Cid { by_cid: HashMap<u16, f32>, default: f32 },
 }
 
 /// Text state parameters that scale a string's advance.
@@ -47,10 +46,25 @@ impl Default for AdvanceState {
 /// width is unknown.
 pub(crate) fn advance(gw: &GlyphWidths, bytes: &[u8], st: &AdvanceState) -> Option<f32> {
     let mut w = 0.0f32;
-    for &b in bytes {
-        w += gw.code_width(b)? / 1000.0 * st.font_size + st.char_spacing;
-        if b == 0x20 {
-            w += st.word_spacing;
+    match gw {
+        GlyphWidths::Simple { by_code, missing } => {
+            for &b in bytes {
+                w += by_code[b as usize].or(*missing)? / 1000.0 * st.font_size + st.char_spacing;
+                if b == 0x20 {
+                    w += st.word_spacing;
+                }
+            }
+        }
+        GlyphWidths::Cid { by_cid, default } => {
+            if bytes.len() % 2 != 0 {
+                return None;
+            }
+            // Word spacing never applies to 2-byte codes (PDF 9.3.3).
+            for c in bytes.chunks_exact(2) {
+                let cid = u16::from_be_bytes([c[0], c[1]]);
+                w += by_cid.get(&cid).copied().unwrap_or(*default) / 1000.0 * st.font_size
+                    + st.char_spacing;
+            }
         }
     }
     Some(w * st.h_scale / 100.0)
@@ -100,8 +114,7 @@ pub(crate) fn page_font_widths(doc: &Document, page_id: ObjectId) -> HashMap<Str
 fn widths_for_font(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
     let subtype = font.get(b"Subtype").ok().and_then(|o| o.as_name().ok()).unwrap_or_default();
     if subtype == b"Type0" {
-        // Composite fonts need CID-keyed /W handling — not measured yet.
-        return None;
+        return cid_widths(doc, font);
     }
 
     let missing = font
@@ -115,18 +128,73 @@ fn widths_for_font(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
     if let (Ok(fc), Ok(w_obj)) = (font.get(b"FirstChar"), font.get(b"Widths")) {
         let first = resolve(doc, fc).as_i64().ok()?.clamp(0, 255) as usize;
         if let Object::Array(arr) = resolve(doc, w_obj) {
-            let mut by_code = [None; 256];
+            let mut by_code = Box::new([None; 256]);
             for (i, item) in arr.iter().enumerate() {
                 let Some(code) = first.checked_add(i).filter(|&c| c < 256) else { break };
                 by_code[code] = num(resolve(doc, item));
             }
-            return Some(GlyphWidths { by_code, missing });
+            return Some(GlyphWidths::Simple { by_code, missing });
         }
     }
 
     // No /Widths: standard-14 built-ins by (aliased) base font name.
     let base = font.get(b"BaseFont").ok().and_then(|o| o.as_name().ok()).unwrap_or_default();
     std14_widths(base)
+}
+
+/// CID-keyed widths of a Type0 font's descendant: /W runs plus the /DW
+/// default (1000 when absent). Only Identity-H style 2-byte-code fonts are
+/// measured — which is what modern generators (and our own re-embedder) emit.
+fn cid_widths(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
+    let enc = font.get(b"Encoding").ok().map(|o| resolve(doc, o));
+    match enc {
+        Some(Object::Name(n)) if n == b"Identity-H" => {}
+        _ => return None, // custom CMap: code -> CID isn't identity, skip
+    }
+    let desc = match font.get(b"DescendantFonts").ok().map(|o| resolve(doc, o)) {
+        Some(Object::Array(a)) => a.first().map(|o| resolve(doc, o).clone())?,
+        _ => return None,
+    };
+    let desc = desc.as_dict().ok()?;
+    let default = desc.get(b"DW").ok().map(|o| resolve(doc, o)).and_then(num).unwrap_or(1000.0);
+
+    let mut by_cid = HashMap::new();
+    if let Ok(Object::Array(w)) = desc.get(b"W").map(|o| resolve(doc, o)) {
+        let mut i = 0usize;
+        while i < w.len() {
+            let Some(first) = num(resolve(doc, &w[i])) else { break };
+            match w.get(i + 1).map(|o| resolve(doc, o)) {
+                // c [w1 w2 ...] — consecutive CIDs starting at c
+                Some(Object::Array(ws)) => {
+                    for (k, item) in ws.iter().enumerate() {
+                        let cid = (first as i64 + k as i64).clamp(0, 65_535) as u16;
+                        if let Some(wv) = num(resolve(doc, item)) {
+                            by_cid.insert(cid, wv);
+                        }
+                    }
+                    i += 2;
+                }
+                // cfirst clast w — a range at one width
+                Some(other) => {
+                    let (Some(last), Some(wv)) =
+                        (num(other), w.get(i + 2).and_then(|o| num(resolve(doc, o))))
+                    else {
+                        break;
+                    };
+                    let (lo, hi) = (first as i64, last as i64);
+                    if hi < lo || hi - lo > 65_535 {
+                        break;
+                    }
+                    for cid in lo..=hi {
+                        by_cid.insert(cid.clamp(0, 65_535) as u16, wv);
+                    }
+                    i += 3;
+                }
+                None => break,
+            }
+        }
+    }
+    Some(GlyphWidths::Cid { by_cid, default })
 }
 
 /// Built-in table for a standard-14 base font name (subset prefixes and the
@@ -148,19 +216,19 @@ pub(crate) fn std14_widths(base_font: &[u8]) -> Option<GlyphWidths> {
         "Times-Italic" | "TimesNewRomanPS-ItalicMT" => (&TIMES_ITALIC, 500.0),
         "Times-BoldItalic" | "TimesNewRomanPS-BoldItalicMT" => (&TIMES_BOLD_ITALIC, 500.0),
         n if n.starts_with("Courier") => {
-            let mut by_code = [None; 256];
+            let mut by_code = Box::new([None; 256]);
             for c in 32..=126usize {
                 by_code[c] = Some(600.0);
             }
-            return Some(GlyphWidths { by_code, missing: Some(600.0) });
+            return Some(GlyphWidths::Simple { by_code, missing: Some(600.0) });
         }
         _ => return None,
     };
-    let mut by_code = [None; 256];
+    let mut by_code = Box::new([None; 256]);
     for (i, &w) in table.iter().enumerate() {
         by_code[32 + i] = Some(w as f32);
     }
-    Some(GlyphWidths { by_code, missing: Some(missing) })
+    Some(GlyphWidths::Simple { by_code, missing: Some(missing) })
 }
 
 // Adobe Core-14 AFM widths, glyph codes 32..=126 (space..asciitilde).
@@ -262,7 +330,35 @@ mod tests {
         // Built-ins carry a family-average missing width, so high bytes still measure.
         let st = AdvanceState { font_size: 12.0, ..Default::default() };
         assert!(advance(&gw, &[0xE9], &st).is_some());
-        let no_missing = GlyphWidths { by_code: [None; 256], missing: None };
+        let no_missing = GlyphWidths::Simple { by_code: Box::new([None; 256]), missing: None };
         assert!(advance(&no_missing, b"A", &st).is_none());
+    }
+
+    #[test]
+    fn cid_widths_parse_both_w_forms() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.5");
+        let desc = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => "Test",
+            "DW" => 800,
+            // CIDs 1..=2 individually, then 5..=7 at one width.
+            "W" => vec![
+                1.into(), Object::Array(vec![500.into(), 600.into()]),
+                5.into(), 7.into(), 250.into(),
+            ],
+        });
+        let font = dictionary! {
+            "Type" => "Font", "Subtype" => "Type0", "BaseFont" => "Test",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(desc)],
+        };
+        let gw = widths_for_font(&doc, &font).expect("Type0 must now measure");
+        let st = AdvanceState { font_size: 10.0, ..Default::default() };
+        // CID 1 (500) + CID 2 (600) = 1100/1000 * 10
+        assert!((advance(&gw, &[0, 1, 0, 2], &st).unwrap() - 11.0).abs() < 1e-4);
+        // CID 6 falls in the range form (250); CID 9 takes /DW (800).
+        assert!((advance(&gw, &[0, 6, 0, 9], &st).unwrap() - 10.5).abs() < 1e-4);
+        // Odd byte length can't be CID codes.
+        assert!(advance(&gw, &[0, 1, 0], &st).is_none());
     }
 }

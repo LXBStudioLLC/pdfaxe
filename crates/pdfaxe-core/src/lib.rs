@@ -6,6 +6,7 @@
 //! so the pure-Rust-renderer-vs-PDFium decision stays swappable without
 //! touching anything else.
 
+pub(crate) mod fonts;
 pub mod images;
 pub(crate) mod metrics;
 pub mod ops;

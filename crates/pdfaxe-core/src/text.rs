@@ -2,26 +2,27 @@
 //! content streams, decode them through the font's encoding, re-encode edited
 //! strings, and patch the content stream in place.
 //!
-//! v1 scope (stated honestly, enforced in code):
+//! Scope (stated honestly, enforced in code):
 //! - Simple single-byte fonts (Type1/TrueType with WinAnsi/Standard encodings
 //!   or a ToUnicode CMap) are editable. Composite (Type0/CID) fonts are
 //!   displayed but marked non-editable unless their ToUnicode map inverts.
-//! - Same font, same baseline: an edit keeps the run's start position. When
-//!   the font's glyph widths are known (/Widths or a standard-14 face), the
-//!   rest of the line shifts to fit the new width and the shift is undone at
-//!   the next line break — same-line reflow. Paragraph re-wrap (moving words
-//!   across lines) is not attempted yet.
-//! - Positions include within-line advances whenever glyph widths are known
-//!   (/Widths or standard-14 metrics); otherwise they fall back to the show
-//!   op's start position.
+//! - An edit keeps the run's start position. When the font's glyph widths are
+//!   known (/Widths, /W, or a standard-14 face), the rest of the line shifts
+//!   to fit the new width and the shift is undone at the next line break —
+//!   same-line reflow; recognizable wrapped prose re-wraps whole paragraphs.
+//! - Text the run's font can't encode no longer refuses: a matching system
+//!   font is subset-embedded and the run switches to it (see [`crate::fonts`]).
+//! - Positions include within-line advances whenever glyph widths are known;
+//!   otherwise they fall back to the show op's start position.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
 use lopdf::content::{Content, Operation};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
+use crate::fonts::{embed_replacement, FontHints};
 use crate::metrics::{advance, page_font_widths, tj_number_advance, AdvanceState, GlyphWidths};
 use crate::ops::resolve_inherited;
 
@@ -687,6 +688,15 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
     Ok(runs)
 }
 
+/// What an edit did beyond changing the string.
+#[derive(Debug, Default, Clone)]
+pub struct EditOutcome {
+    /// Set when the text needed glyphs the run's own font couldn't encode, so
+    /// a system font was subset-embedded and the run switched to it. Carries
+    /// the human-facing name of the stand-in ("Arial Bold").
+    pub refont: Option<String>,
+}
+
 /// Replace the text of one run (same font) and patch the page's content
 /// stream. Layout preservation, best first:
 /// 1. Paragraph re-wrap — when the run is a line of recognizable wrapped
@@ -695,20 +705,20 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
 ///    the run's line shifts by the width delta and un-shifts at the next
 ///    line break.
 /// 3. In-place patch — when widths are unknown or the text matrix is rotated.
+/// When the font's encoding can't express the new text at all, a matching
+/// system font is subset-embedded and just this run switches to it (see
+/// `fonts`); the returned [`EditOutcome`] says so.
 /// Content-stream op indices may change — re-list runs after every edit.
-pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str) -> Result<()> {
+pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str) -> Result<EditOutcome> {
     let pages = doc.get_pages();
     let &page_id = pages.get(&page_no).ok_or_else(|| anyhow!("page {page_no} out of range"))?;
     let codecs = page_font_codecs(doc, page_id);
     let codec = codecs
         .get(&run.font_res)
         .ok_or_else(|| anyhow!("font {} not found in page resources", run.font_res))?;
-    let new_bytes = codec.encode(new_text).ok_or_else(|| {
-        anyhow!(
-            "this font's encoding can't represent that text yet — try characters that already \
-             appear in the document (full font re-embedding is on the roadmap)"
-        )
-    })?;
+    let Some(new_bytes) = codec.encode(new_text) else {
+        return refont_edit(doc, page_id, run, new_text);
+    };
     let widths = page_font_widths(doc, page_id);
 
     let content_bytes = doc.get_page_content(page_id);
@@ -718,7 +728,7 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
         let encoded = content.encode().map_err(|e| anyhow!("couldn't re-encode page content: {e}"))?;
         doc.change_page_content(page_id, encoded)
             .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
-        return Ok(());
+        return Ok(EditOutcome::default());
     }
 
     let op: &mut Operation = content
@@ -738,12 +748,167 @@ pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str)
         _ => return Err(anyhow!("run no longer matches the content stream — reload the page")),
     };
 
-    reflow_line(&mut content.operations, run.op_index, run.tj_item, &old_bytes, &new_bytes, &widths);
+    reflow_line(&mut content.operations, run.op_index, run.tj_item, &old_bytes, &new_bytes, &widths, None);
 
     let encoded = content.encode().map_err(|e| anyhow!("couldn't re-encode page content: {e}"))?;
     doc.change_page_content(page_id, encoded)
         .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
-    Ok(())
+    Ok(EditOutcome::default())
+}
+
+/// Fallback for text the run's own font can't encode: subset-embed a matching
+/// system font and switch just this run to it. The show op is re-encoded as
+/// 2-byte CIDs wrapped in `Tf` switches; when the run is one string of a TJ
+/// array, the array is split around it so every kern number keeps its place.
+fn refont_edit(doc: &mut Document, page_id: ObjectId, run: &TextRun, new_text: &str) -> Result<EditOutcome> {
+    let (base, hints) = font_identity(doc, page_id, &run.font_res);
+    let chars: BTreeSet<char> = new_text.chars().collect();
+    let embedded = embed_replacement(doc, &base, hints, &chars).map_err(|e| {
+        anyhow!("this font's encoding can't represent that text, and no installed font could stand in ({e})")
+    })?;
+    let res_name = add_page_font(doc, page_id, embedded.font_id)?;
+
+    let mut new_bytes = Vec::with_capacity(new_text.len() * 2);
+    for ch in new_text.chars() {
+        // embed_replacement guarantees coverage of every char in `chars`.
+        new_bytes.extend_from_slice(&embedded.encode[&ch].to_be_bytes());
+    }
+
+    let content_bytes = doc.get_page_content(page_id);
+    let mut content = Content::decode(&content_bytes).map_err(|e| anyhow!("couldn't parse page content: {e}"))?;
+    let ops = &mut content.operations;
+
+    let stale = || anyhow!("content changed since runs were listed — reload the page");
+    let tf = |name: &str, size: f32| {
+        Operation::new("Tf", vec![Object::Name(name.as_bytes().to_vec()), size.into()])
+    };
+
+    let (edit_idx, edit_tj, old_bytes);
+    match run.tj_item {
+        None => {
+            let op = ops.get_mut(run.op_index).ok_or_else(stale)?;
+            let target = op.operands.iter_mut().rev().find(|o| matches!(o, Object::String(..)));
+            let Some(Object::String(bytes, format)) = target else { return Err(stale()) };
+            old_bytes = std::mem::replace(bytes, new_bytes.clone());
+            *format = StringFormat::Hexadecimal;
+            ops.insert(run.op_index, tf(&res_name, run.font_size));
+            ops.insert(run.op_index + 2, tf(&run.font_res, run.font_size));
+            edit_idx = run.op_index + 1;
+            edit_tj = None;
+        }
+        Some(k) => {
+            let op = ops.get(run.op_index).ok_or_else(stale)?;
+            if op.operator != "TJ" {
+                return Err(stale());
+            }
+            let Some(Object::Array(items)) = op.operands.first() else { return Err(stale()) };
+            let Some(Object::String(old, _)) = items.get(k) else { return Err(stale()) };
+            old_bytes = old.clone();
+            let prefix = items[..k].to_vec();
+            let suffix = items[k + 1..].to_vec();
+            let mut seq = Vec::with_capacity(5);
+            if !prefix.is_empty() {
+                seq.push(Operation::new("TJ", vec![Object::Array(prefix)]));
+            }
+            seq.push(tf(&res_name, run.font_size));
+            let rel = seq.len();
+            seq.push(Operation::new(
+                "TJ",
+                vec![Object::Array(vec![Object::String(new_bytes.clone(), StringFormat::Hexadecimal)])],
+            ));
+            seq.push(tf(&run.font_res, run.font_size));
+            if !suffix.is_empty() {
+                seq.push(Operation::new("TJ", vec![Object::Array(suffix)]));
+            }
+            ops.splice(run.op_index..=run.op_index, seq);
+            edit_idx = run.op_index + rel;
+            edit_tj = Some(0);
+        }
+    }
+
+    // Both fonts are measurable now (the embedded one through its /W array),
+    // so the usual same-line reflow applies across the font switch.
+    let widths = page_font_widths(doc, page_id);
+    reflow_line(ops, edit_idx, edit_tj, &old_bytes, &new_bytes, &widths, Some(&run.font_res));
+
+    let encoded = content.encode().map_err(|e| anyhow!("couldn't re-encode page content: {e}"))?;
+    doc.change_page_content(page_id, encoded)
+        .map_err(|e| anyhow!("couldn't write page content: {e}"))?;
+    Ok(EditOutcome { refont: Some(embedded.label) })
+}
+
+/// BaseFont name + style hints for one font resource on a page, feeding the
+/// system-font matcher.
+fn font_identity(doc: &Document, page_id: ObjectId, font_res: &str) -> (String, FontHints) {
+    let mut base = String::new();
+    let mut hints = FontHints::default();
+    let font = (|| -> Option<Dictionary> {
+        let res = resolve_inherited(doc, page_id, b"Resources")?;
+        let res = resolve(doc, &res).clone();
+        let fonts = res.as_dict().ok()?.get(b"Font").ok().cloned()?;
+        let fonts = resolve(doc, &fonts).clone();
+        let font = fonts.as_dict().ok()?.get(font_res.as_bytes()).ok().cloned()?;
+        resolve(doc, &font).as_dict().ok().cloned()
+    })();
+    let Some(font) = font else { return (base, hints) };
+    if let Ok(b) = font.get(b"BaseFont") {
+        if let Ok(name) = resolve(doc, b).as_name() {
+            base = String::from_utf8_lossy(name).into_owned();
+        }
+    }
+    if let Some(desc) = font
+        .get(b"FontDescriptor")
+        .ok()
+        .map(|o| resolve(doc, o))
+        .and_then(|o| o.as_dict().ok())
+    {
+        if let Some(flags) = desc.get(b"Flags").ok().and_then(|f| f.as_i64().ok()) {
+            hints.fixed = flags & 1 != 0;
+            hints.serif = flags & 2 != 0;
+            hints.italic = flags & 64 != 0;
+        }
+        if let Some(angle) = desc.get(b"ItalicAngle").ok().and_then(num) {
+            hints.italic |= angle.abs() > 0.1;
+        }
+        if let Some(stem) = desc.get(b"StemV").ok().and_then(num) {
+            hints.bold |= stem >= 120.0;
+        }
+        if let Some(weight) = desc.get(b"FontWeight").ok().and_then(num) {
+            hints.bold |= weight >= 600.0;
+        }
+    }
+    (base, hints)
+}
+
+/// Register `font_id` under a fresh name in the page's /Resources /Font dict.
+/// The resolved resources are cloned onto the page itself, so inherited or
+/// shared dictionaries on other pages stay untouched.
+fn add_page_font(doc: &mut Document, page_id: ObjectId, font_id: ObjectId) -> Result<String> {
+    let res = resolve_inherited(doc, page_id, b"Resources");
+    let mut res_dict: Dictionary = match res.as_ref().map(|o| resolve(doc, o)) {
+        Some(Object::Dictionary(d)) => d.clone(),
+        _ => Dictionary::new(),
+    };
+    let mut font_dict: Dictionary = match res_dict.get(b"Font").ok().map(|o| resolve(doc, o).clone()) {
+        Some(Object::Dictionary(d)) => d,
+        _ => Dictionary::new(),
+    };
+    let mut n = 0u32;
+    let name = loop {
+        let cand = format!("PXF{n}");
+        if font_dict.get(cand.as_bytes()).is_err() {
+            break cand;
+        }
+        n += 1;
+    };
+    font_dict.set(name.clone(), Object::Reference(font_id));
+    res_dict.set("Font", Object::Dictionary(font_dict));
+    let page = doc
+        .get_object_mut(page_id)
+        .and_then(|o| o.as_dict_mut())
+        .map_err(|e| anyhow!("page dictionary unavailable: {e}"))?;
+    page.set("Resources", Object::Dictionary(res_dict));
+    Ok(name)
 }
 
 /// One whole-line show op, as collected for paragraph re-wrap.
@@ -1004,6 +1169,10 @@ fn try_rewrap(
 ///
 /// Best-effort by design: bails without touching anything when widths are
 /// unknown or a rotated/scaled text matrix is involved.
+///
+/// `old_font` overrides which font's widths measure `old_bytes` — used after a
+/// refont, where the edit op now runs in the embedded font but the replaced
+/// bytes belonged to the original one.
 fn reflow_line(
     ops: &mut Vec<Operation>,
     edit_op: usize,
@@ -1011,6 +1180,7 @@ fn reflow_line(
     old_bytes: &[u8],
     new_bytes: &[u8],
     widths: &HashMap<String, GlyphWidths>,
+    old_font: Option<&str>,
 ) {
     const EPS: f32 = 0.05;
     let opnum = |op: &Operation, i: usize| op.operands.get(i).and_then(num).unwrap_or(0.0);
@@ -1095,7 +1265,14 @@ fn reflow_line(
         return;
     }
     let Some(gw) = widths.get(&font_res) else { return };
-    let (Some(old_adv), Some(new_adv)) = (advance(gw, old_bytes, &st), advance(gw, new_bytes, &st))
+    let old_gw = match old_font {
+        Some(name) => match widths.get(name) {
+            Some(g) => g,
+            None => return,
+        },
+        None => gw,
+    };
+    let (Some(old_adv), Some(new_adv)) = (advance(old_gw, old_bytes, &st), advance(gw, new_bytes, &st))
     else {
         return;
     };
@@ -1229,11 +1406,113 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unencodable_text() {
+    fn rejects_text_no_font_can_carry() {
         let mut doc = load(fixture("sample-a.pdf")).unwrap();
         let runs = text_runs(&doc, 1).unwrap();
         let secret = runs.iter().find(|r| r.text.contains("SECRET")).unwrap().clone();
-        assert!(edit_run(&mut doc, 1, &secret, "日本語テキスト").is_err());
+        // U+FFFE is a noncharacter: no font maps it, so even the system-font
+        // fallback must refuse rather than emit .notdef boxes.
+        assert!(edit_run(&mut doc, 1, &secret, "bad \u{FFFE} char").is_err());
+    }
+
+    /// True when the machine has a font covering `text` — refont tests skip
+    /// themselves on bare machines instead of failing.
+    fn refont_available(text: &str) -> bool {
+        let chars: BTreeSet<char> = text.chars().collect();
+        let mut probe = Document::with_version("1.7");
+        if embed_replacement(&mut probe, "Helvetica", FontHints::default(), &chars).is_err() {
+            eprintln!("skipping: no system font covers {text:?}");
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn refont_embeds_replacement_for_foreign_glyphs() {
+        let new_text = "Ω→SECRET-Ω";
+        if !refont_available(new_text) {
+            return;
+        }
+        let mut doc = load(fixture("sample-a.pdf")).unwrap();
+        let runs = text_runs(&doc, 1).unwrap();
+        let secret = runs.iter().find(|r| r.text.contains("SECRET")).unwrap().clone();
+
+        let outcome = edit_run(&mut doc, 1, &secret, new_text).unwrap();
+        assert!(outcome.refont.is_some(), "edit must report the embedded stand-in");
+
+        let after = text_runs(&doc, 1).unwrap();
+        let run = after
+            .iter()
+            .find(|r| r.text == new_text)
+            .expect("re-listed run must decode via the generated ToUnicode")
+            .clone();
+        assert!(run.editable, "ToUnicode must keep the run editable");
+        assert!(run.width.is_some(), "the /W array must make the run measurable");
+
+        // Survives save/reload, and the refonted run takes further edits —
+        // including chars that force a second embed ('A' wasn't in the subset).
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        let mut re = Document::load_mem(&buf).unwrap();
+        let runs2 = text_runs(&re, 1).unwrap();
+        let run2 = runs2.iter().find(|r| r.text == new_text).unwrap().clone();
+        edit_run(&mut re, 1, &run2, "Ω→AXE").unwrap();
+        assert!(text_runs(&re, 1).unwrap().iter().any(|r| r.text == "Ω→AXE"));
+
+        // And the renderer actually rasterizes the embedded subset: inked
+        // (non-white) pixels must appear inside the run's box. The fixture's
+        // run is red, so test distance-from-white, not darkness.
+        let img = crate::render::render_page_rgba(&buf, 1, 800).unwrap();
+        let sx = img.width as f32 / img.point_width;
+        let sy = img.height as f32 / img.point_height;
+        let (x0, x1) = ((run.x * sx) as usize, ((run.x + run.width.unwrap()) * sx) as usize);
+        let y0 = ((img.point_height - run.y - run.font_size) * sy).max(0.0) as usize;
+        let y1 = ((img.point_height - run.y) * sy) as usize;
+        let mut inked = 0u32;
+        for py in y0..y1.min(img.height as usize) {
+            for px in x0..x1.min(img.width as usize) {
+                let o = (py * img.width as usize + px) * 4;
+                let (r, g, b, a) =
+                    (img.pixels[o], img.pixels[o + 1], img.pixels[o + 2], img.pixels[o + 3]);
+                if a > 128 && (r as u32 + g as u32 + b as u32) < 600 {
+                    inked += 1;
+                }
+            }
+        }
+        assert!(inked > 20, "embedded font must rasterize, got {inked} inked pixels in the run box");
+    }
+
+    #[test]
+    fn refont_splits_tj_and_keeps_kerns() {
+        if !refont_available("Ω") {
+            return;
+        }
+        let content: &[u8] = b"BT /F1 12 Tf 50 700 Td [(AB) -100 (CD) -50 (EF)] TJ ET";
+        let mut doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs[1].text, "CD");
+
+        let outcome = edit_run(&mut doc, 1, &runs[1], "Ω").unwrap();
+        assert!(outcome.refont.is_some());
+
+        let after = text_runs(&doc, 1).unwrap();
+        let texts: Vec<&str> = after.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["AB", "Ω", "EF"], "TJ must split around the refonted item");
+
+        // Kern numbers keep their place: -100 before Ω, -50 before EF.
+        let (ab, om, ef) = (&after[0], &after[1], &after[2]);
+        let kern = |n: f32| -n / 1000.0 * 12.0;
+        assert!(
+            (om.x - (ab.x + ab.width.unwrap() + kern(-100.0))).abs() < 0.05,
+            "kern before the edit lost: om.x={}, expected {}",
+            om.x,
+            ab.x + ab.width.unwrap() + kern(-100.0)
+        );
+        assert!(
+            (ef.x - (om.x + om.width.unwrap() + kern(-50.0))).abs() < 0.05,
+            "kern after the edit lost: ef.x={}",
+            ef.x
+        );
     }
 
     /// Minimal one-page document with the given font as /F1.
@@ -1288,8 +1567,15 @@ mod tests {
         edit_run(&mut doc, 1, &runs[0], "éé").unwrap();
         let after = text_runs(&doc, 1).unwrap();
         assert_eq!(after[0].text, "éé");
-        // 'A' no longer exists in this font's encoding — must refuse.
-        assert!(edit_run(&mut doc, 1, &after[0], "A").is_err());
+        // 'A' no longer exists in this font's encoding — the system-font
+        // fallback must carry it (or refuse cleanly on machines without one).
+        match edit_run(&mut doc, 1, &after[0], "A") {
+            Ok(outcome) => {
+                assert!(outcome.refont.is_some(), "an out-of-encoding edit must report its embed");
+                assert!(text_runs(&doc, 1).unwrap().iter().any(|r| r.text == "A"));
+            }
+            Err(_) => eprintln!("no system font available — refusal accepted"),
+        }
     }
 
     #[test]

@@ -911,12 +911,15 @@ impl eframe::App for PdfaxeApp {
 
             if let Some(run) = apply_edit {
                 match edit_run(&mut open.doc, page, &run, &open.edit_buffer) {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         open.refresh_bytes();
                         open.invalidate_page(page);
                         open.selected_run = None;
                         open.edited = true;
-                        self.status = "Edited — rendering the result…".into();
+                        self.status = match outcome.refont {
+                            Some(font) => format!("Edited — new characters set in embedded {font}…"),
+                            None => "Edited — rendering the result…".into(),
+                        };
                     }
                     Err(e) => self.status = format!("Edit failed: {e:#}"),
                 }
