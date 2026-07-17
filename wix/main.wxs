@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PDFAxe per-user installer. No admin rights, no UAC: everything lands in
+  %LOCALAPPDATA%\Programs\PDFAxe and HKCU. The .pdf association is additive
+  ("Open with" entry via OpenWithProgids) — it never steals the user's
+  default PDF handler.
+
+  Build with build-msi.ps1 (needs the WiX 3.14 binaries and cargo-wix).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="PDFAxe"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="LXB Studio LLC"
+           UpgradeCode="709CA4E9-2E48-457E-A547-614B305FC62F">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             Description="PDFAxe $(var.Version) — local, private PDF surgery"
+             Manufacturer="LXB Studio LLC" />
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of PDFAxe is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="PdfaxeIco" SourceFile="assets\pdfaxe.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PdfaxeIco" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://pdfaxe.app" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="PXPrograms" Name="Programs">
+          <Directory Id="APPLICATIONFOLDER" Name="PDFAxe" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <DirectoryRef Id="APPLICATIONFOLDER">
+      <Component Id="AppExe" Guid="D4CEAC14-A869-45AD-9717-7E943ACC21E8">
+        <RegistryValue Root="HKCU" Key="Software\LXBStudio\PDFAxe" Name="AppExe"
+                       Type="string" Value="1" KeyPath="yes" />
+        <File Id="AppExeFile" Name="pdfaxe-app.exe"
+              Source="$(var.CargoTargetBinDir)\pdfaxe-app.exe" />
+        <RemoveFolder Id="RemoveAppFolder" Directory="APPLICATIONFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemovePXPrograms" Directory="PXPrograms" On="uninstall" />
+      </Component>
+      <!-- The CLI installs as plain pdfaxe.exe — matches its command name. -->
+      <Component Id="CliExe" Guid="411EFF14-D0AE-4B5E-B6BC-498BC9EEF5B2">
+        <RegistryValue Root="HKCU" Key="Software\LXBStudio\PDFAxe" Name="CliExe"
+                       Type="string" Value="1" KeyPath="yes" />
+        <File Id="CliExeFile" Name="pdfaxe.exe"
+              Source="$(var.CargoTargetBinDir)\pdfaxe-cli.exe" />
+        <Environment Id="PdfaxePath" Name="PATH" Value="[APPLICATIONFOLDER]"
+                     Part="last" Action="set" System="no" Permanent="no" />
+      </Component>
+      <Component Id="PdfAssoc" Guid="7E21171C-B146-4200-A3F2-7092D4B8CEFA">
+        <RegistryValue Root="HKCU" Key="Software\Classes\PDFAxe.Document"
+                       Type="string" Value="PDF document" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\PDFAxe.Document\DefaultIcon"
+                       Type="string" Value="&quot;[APPLICATIONFOLDER]pdfaxe-app.exe&quot;,0" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\PDFAxe.Document\shell\open"
+                       Type="string" Value="Open with PDFAxe" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\PDFAxe.Document\shell\open\command"
+                       Type="string" Value="&quot;[APPLICATIONFOLDER]pdfaxe-app.exe&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.pdf\OpenWithProgids"
+                       Name="PDFAxe.Document" Type="string" Value="" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="9A0BEF5D-3926-48E4-AE81-4F4F5426DB48">
+        <RegistryValue Root="HKCU" Key="Software\LXBStudio\PDFAxe" Name="Shortcut"
+                       Type="string" Value="1" KeyPath="yes" />
+        <Shortcut Id="AppShortcut" Name="PDFAxe"
+                  Description="Local, private PDF surgery — nothing leaves your machine"
+                  Target="[APPLICATIONFOLDER]pdfaxe-app.exe"
+                  WorkingDirectory="APPLICATIONFOLDER"
+                  Icon="PdfaxeIco" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Complete" Title="PDFAxe" Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="CliExe" />
+      <ComponentRef Id="PdfAssoc" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>
