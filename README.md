@@ -136,9 +136,26 @@ cargo build --release --workspace    # optimized binaries
    ~~redact box-drawing~~, ~~image drop zone~~, ~~search-in-document~~ — done.
 3. ~~More ops at parity with the web suite~~: ~~images→PDF~~, ~~PDF→images~~,
    ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine, CLI and GUI all done.
-4. Distribution: release profile is configured (thin LTO, stripped); add `cargo-wix`
-   MSI packaging, file association + "Open with PDFAxe", icon, code signing.
+4. ~~Distribution~~: signed per-user MSI with AGPL license dialog, "Open with
+   PDFAxe" association, Start Menu + PATH; CI + tagged releases (see below).
 5. Windows polish: jump lists, recent files, dark mode following system.
+
+## Installer + releases
+
+`build-msi.ps1` builds the per-user MSI (WiX 3.14 binaries + `cargo-wix`; set
+`PDFAXE_WIX_BIN` if WiX lives elsewhere). Both exes and the MSI are signed via
+Azure Trusted Signing (`ci/sign.ps1`, override with `LXB_SIGN_SCRIPT`); without
+`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` in the environment the
+build completes unsigned with a warning. The installer opens with the AGPL
+license dialog — `wix/License.rtf` and the dialog art are committed, regenerated
+from `LICENSE` / `assets/logo.png` by `wix/make-license-rtf.ps1` and
+`wix/make-installer-art.ps1`.
+
+CI (`.github/workflows/ci.yml`) runs the test suite and packages an unsigned
+MSI artifact on every push and PR. Pushing a `vX.Y.Z` tag (it must match the
+workspace version in `Cargo.toml`) runs `release.yml`: signed build, hard
+signature verification, sha256 checksum, and a **draft** GitHub release for
+human review before publishing.
 
 ## License
 

@@ -1,0 +1,70 @@
+# Every push/PR: run the test suite and package an UNSIGNED MSI artifact.
+# No secrets are used here, so fork PRs build fine; ci/sign.ps1 skips signing
+# with a warning when the Azure creds are absent. Signed MSIs come from
+# release.yml only.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Release profile so the MSI step below reuses these exact binaries.
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Cache WiX 3.14.1
+        id: wix-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\wix314
+          key: wix-3.14.1-binaries
+
+      - name: Install WiX 3.14.1
+        if: steps.wix-cache.outputs.cache-hit != 'true'
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" -OutFile "$env:TEMP\wix314.zip"
+          Expand-Archive "$env:TEMP\wix314.zip" -DestinationPath C:\wix314
+
+      - name: Cache cargo-wix
+        id: cargowix-cache
+        uses: actions/cache@v4
+        with:
+          path: ~\.cargo\bin\cargo-wix.exe
+          key: cargo-wix-0.3.9
+
+      - name: Install cargo-wix
+        if: steps.cargowix-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Package MSI (unsigned)
+        env:
+          PDFAXE_WIX_BIN: C:\wix314
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File build-msi.ps1
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfaxe-msi-unsigned
+          path: target/wix/*.msi
+          if-no-files-found: error

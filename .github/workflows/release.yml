@@ -1,0 +1,107 @@
+# Tag vX.Y.Z: build, sign every artifact via Azure Trusted Signing, verify the
+# signatures, and attach the MSI (+ sha256) to a DRAFT GitHub release for a
+# human to review and publish. workflow_dispatch runs the same pipeline as a
+# dry run (build + sign + verify + artifact) without creating a release.
+# Needs repo secrets AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag must match Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $cargo = ($meta.packages | Where-Object { $_.name -eq 'pdfaxe-app' }).version
+          $tag = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($tag -ne $cargo) { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $cargo" }
+
+      # Same version as the dotnet "sign" global tool used for local releases.
+      - name: Install sign CLI
+        run: dotnet tool install --global sign --version 0.9.1-beta.26179.1
+
+      - name: Cache WiX 3.14.1
+        id: wix-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\wix314
+          key: wix-3.14.1-binaries
+
+      - name: Install WiX 3.14.1
+        if: steps.wix-cache.outputs.cache-hit != 'true'
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" -OutFile "$env:TEMP\wix314.zip"
+          Expand-Archive "$env:TEMP\wix314.zip" -DestinationPath C:\wix314
+
+      - name: Cache cargo-wix
+        id: cargowix-cache
+        uses: actions/cache@v4
+        with:
+          path: ~\.cargo\bin\cargo-wix.exe
+          key: cargo-wix-0.3.9
+
+      - name: Install cargo-wix
+        if: steps.cargowix-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build and sign MSI
+        env:
+          PDFAXE_WIX_BIN: C:\wix314
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File build-msi.ps1
+
+      # A release artifact that is not Valid-signed must never ship.
+      - name: Verify signatures
+        run: |
+          $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $bin = Join-Path $meta.target_directory "release"
+          $msi = Get-ChildItem (Join-Path $meta.target_directory "wix\*.msi") | Sort-Object LastWriteTime | Select-Object -Last 1
+          foreach ($f in (Join-Path $bin "pdfaxe-app.exe"), (Join-Path $bin "pdfaxe-cli.exe"), $msi.FullName) {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host ("{0,-12} {1}" -f $sig.Status, $f)
+            if ($sig.Status -ne 'Valid') { throw "NOT VALIDLY SIGNED: $f" }
+          }
+          $hash = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash.ToLower()
+          $sha = "$($msi.FullName).sha256"
+          "$hash  $($msi.Name)" | Out-File -FilePath $sha -Encoding ascii
+          "MSI_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SHA_PATH=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload signed MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfaxe-msi-signed
+          path: |
+            target/wix/*.msi
+            target/wix/*.sha256
+          if-no-files-found: error
+
+      - name: Draft GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:MSI_PATH $env:SHA_PATH --draft --verify-tag --title "PDFAxe $($env:GITHUB_REF_NAME.TrimStart('v'))" --generate-notes

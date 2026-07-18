@@ -13,9 +13,13 @@ $wix = if ($env:PDFAXE_WIX_BIN) { $env:PDFAXE_WIX_BIN } else { "$env:USERPROFILE
 if (-not (Test-Path "$wix\candle.exe")) {
     throw "WiX binaries not found at $wix - set PDFAXE_WIX_BIN or unzip wix314-binaries there."
 }
-$signer = if ($env:LXB_SIGN_SCRIPT) { $env:LXB_SIGN_SCRIPT } else { "$env:USERPROFILE\lxb-tools\Sign-LxbFile.ps1" }
+# Signer resolution: explicit override, then the LXB tools copy (this
+# machine), then the repo-local copy (CI and contributor builds).
+$signer = $env:LXB_SIGN_SCRIPT
+if (-not $signer) { $signer = "$env:USERPROFILE\lxb-tools\Sign-LxbFile.ps1" }
+if (-not (Test-Path $signer)) { $signer = Join-Path $PSScriptRoot "ci\sign.ps1" }
 if (-not (Test-Path $signer)) {
-    throw "Sign-LxbFile.ps1 not found at $signer - set LXB_SIGN_SCRIPT."
+    throw "No sign script found - set LXB_SIGN_SCRIPT."
 }
 
 function Sign-One([string]$Path, [string]$Name) {
