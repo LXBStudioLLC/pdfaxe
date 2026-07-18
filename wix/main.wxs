@@ -24,6 +24,17 @@
                   DowngradeErrorMessage="A newer version of PDFAxe is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!--
+      License dialog: WixUI_Minimal is the one-screen welcome + AGPL EULA +
+      Install flow (right for a per-user installer with no options to pick).
+      License.rtf and the two bitmaps are generated from LICENSE and the real
+      logo by make-license-rtf.ps1 / make-installer-art.ps1 (both committed).
+    -->
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="wix\banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="wix\dialog.bmp" />
+
     <Icon Id="PdfaxeIco" SourceFile="assets\pdfaxe.ico" />
     <Property Id="ARPPRODUCTICON" Value="PdfaxeIco" />
     <Property Id="ARPNOREPAIR" Value="1" />
