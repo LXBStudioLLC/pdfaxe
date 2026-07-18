@@ -17,9 +17,10 @@ const TILE: [f32; 3] = [0x0F as f32, 0x17 as f32, 0x2A as f32]; // slate-900
 
 /// The crossed axe heads inside the 1024 render — safely above the wordmark.
 const AXES_CROP: (f32, f32, f32, f32) = (84.0, 124.0, 944.0, 545.0);
-/// One axe head (the left one) — near-square, the only form with enough
-/// geometry left to read at 16 px.
-const AXE1_CROP: (f32, f32, f32, f32) = (90.0, 128.0, 540.0, 558.0);
+/// Center of the crossed pair — both heads and the X of the handles, outer
+/// blade tips sacrificed. Near-square, so BOTH axes (the brand) stay present
+/// even on the smallest tiles.
+const AXES_CENTER: (f32, f32, f32, f32) = (150.0, 126.0, 700.0, 560.0);
 
 struct Rgba {
     px: Vec<[f32; 4]>, // straight RGBA, 0..255
@@ -239,14 +240,14 @@ fn main() {
         std::fs::write(bmp_path, &bmp).expect("couldn't write matted bmp");
     }
 
-    // Degrade gracefully as the raster budget shrinks: the full logo keeps
-    // the crossed pair; small tiles get a single axe head (near-square, so
-    // it fills the tile) with a thickened glow.
+    // Both axes at every size — they are the brand. Full logo where it fits;
+    // small tiles crop to the center of the crossed pair (both heads + the
+    // X of the handles) with a thickened glow.
     let sizes: [(u32, (f32, f32, f32, f32), f32, Mode); 7] = [
-        (16, AXE1_CROP, 0.02, Mode::ArtBoost),
-        (24, AXE1_CROP, 0.03, Mode::ArtBoost),
-        (32, AXE1_CROP, 0.05, Mode::ArtBoost),
-        (48, AXE1_CROP, 0.06, Mode::ArtBoost),
+        (16, AXES_CENTER, 0.02, Mode::ArtBoost),
+        (24, AXES_CENTER, 0.03, Mode::ArtBoost),
+        (32, AXES_CENTER, 0.05, Mode::ArtBoost),
+        (48, AXES_CENTER, 0.06, Mode::ArtBoost),
         (64, full, 0.08, Mode::Art),
         (128, full, 0.08, Mode::Art),
         (256, full, 0.08, Mode::Art),
