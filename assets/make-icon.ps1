@@ -4,7 +4,7 @@
 # recovers alpha by difference matting and packs the multi-size .ico.
 # ASCII only: Windows PowerShell 5.1 reads BOM-less scripts as ANSI.
 param(
-    [string]$LogoSvg = "$env:USERPROFILE\OneDrive\Desktop\LXBStudio\-=PDFAXE=-\PDF AXE logo.svg",
+    [string]$LogoSvg = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "PDF AXE logo.svg"),
     [string]$Chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 )
 $ErrorActionPreference = "Stop"
