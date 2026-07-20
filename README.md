@@ -1,163 +1,168 @@
-# PDFAxe — Windows app (100% Rust)
+<p align="center">
+  <img src="assets/logo.png" width="200" alt="PDFAxe — the crossed axes">
+</p>
 
-The product: a native, local-only PDF app. No uploads, no account, no telemetry —
-architecturally incapable of seeing your files. The mission wedge (real in-place text
-editing) gets built here.
+<h1 align="center">PDFAxe</h1>
 
-## Stack — pure Rust, zero C/C++ FFI
+<p align="center"><b>Local, private PDF surgery.</b><br>
+A native Windows PDF editor in 100% Rust — no uploads, no account, no telemetry.<br>
+Architecturally incapable of seeing your files.</p>
 
-| Layer | Crate | Why |
+<p align="center">
+  <a href="https://pdfaxe.app"><b>pdfaxe.app</b></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/LXBStudioLLC/pdfaxe/actions/workflows/ci.yml"><img src="https://github.com/LXBStudioLLC/pdfaxe/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/release-imminent-e5311b" alt="Release imminent">
+  <img src="https://img.shields.io/badge/rust-100%25%20%C2%B7%20zero%20FFI-b7410e" alt="100% Rust, zero FFI">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-e5311b" alt="AGPL-3.0">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-17171a" alt="Windows 10/11 x64">
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/readme/app-window.png" width="900" alt="PDFAxe — five-page document open, thumbnail rail, toolbar with Edit text / Redact / Watermark / Page numbers">
+</p>
+
+## Why
+
+Every mainstream PDF tool wants your document on their server or your card on
+their subscription. PDFAxe is the opposite bet:
+
+- **Local only.** The app contains no network code. Files can't leave the
+  machine because there is no road out.
+- **Real text editing.** In-place edits keep the original font and position,
+  with same-line reflow, paragraph re-wrap, and font re-embedding for glyphs
+  the document never used.
+- **Free forever.** AGPL-3.0 copyleft — the app and every fork stay open
+  source. Businesses pay for deployment and update rollouts, never per seat.
+
+## Operations
+
+| # | Operation | Surface | Notes |
+|---|---|---|---|
+| 01 | `edit-text` | GUI · CLI | In-place: same font, same position; reflow + re-wrap + font re-embedding |
+| 02 | `redact` | GUI · CLI | Raster burn — pixels destroyed; extraction of a redacted page returns nothing |
+| 03 | `merge` | CLI | Inheritable page attributes carried correctly |
+| 04 | `extract` | CLI | Page ranges into new documents |
+| 05 | `reorder` / `rotate` | GUI · CLI | One `assemble()` primitive under both |
+| 06 | `watermark` | GUI · CLI | Diagonal translucent stamp, alpha honored |
+| 07 | `page-numbers` | GUI · CLI | Templated — `"{page} / {total}"` |
+| 08 | `images` → PDF | GUI · CLI | JPEG embedded as-is (lossless), PNG Flate |
+| 09 | PDF → PNG | CLI | Pure-Rust raster export, page ranges |
+| 10 | search | GUI | Ctrl+F across all pages with match stepping |
+| 11 | `info` / `runs` | CLI | Object-level inspection, positioned text runs |
+| 12 | Open-with | shell | `.pdf` association, drag-and-drop files or images |
+
+Everything above is shipped and verified — see the
+[verification log](docs/VERIFICATION.md) for exactly how.
+
+## Install
+
+Signed per-user MSI (≈11 MB) from **[Releases](https://github.com/LXBStudioLLC/pdfaxe/releases)** —
+first public release lands with the `v0.1.0` tag.
+
+- Signed **LXB Studio LLC** via Azure Trusted Signing
+- SHA-256 checksum published with every release
+- Windows 10 / 11, 64-bit · no admin rights needed (per-user install)
+- No account, no license key, no telemetry — install and cut
+
+## The CLI
+
+The full engine is scriptable — the GUI and CLI ride identical code paths:
+
+```console
+$ pdfaxe info report.pdf
+$ pdfaxe merge -o out.pdf a.pdf b.pdf
+$ pdfaxe extract in.pdf -o part.pdf --pages "2-5"
+$ pdfaxe edit-text in.pdf -o out.pdf --find "DRAFT" --replace "FINAL"
+$ pdfaxe redact in.pdf -o out.pdf --page 1 --rect "38,635,130,22"
+$ pdfaxe watermark in.pdf -o out.pdf --text "CONFIDENTIAL"
+$ pdfaxe page-numbers in.pdf -o out.pdf --format "{page} / {total}"
+$ pdfaxe images -o out.pdf scan1.jpg scan2.png
+$ pdfaxe render in.pdf -o page.png --pages "1-3" --width 1200
+```
+
+## Built from — 100% Rust, zero C/C++ FFI
+
+| Layer | Crate | Duty |
 |---|---|---|
-| Document surgery | `lopdf` (MIT) | parse/rebuild PDF object graphs |
-| Rasterization | `hayro` (typst ecosystem) | pure-Rust PDF renderer, incl. its own JPEG2000/JBIG2 decoders |
-| UI | `egui`/`eframe` 0.35 | immediate-mode native GUI |
-| Dialogs | `rfd` | native Windows file dialogs |
-| CLI | `clap` | scriptable surface + test harness |
+| Document surgery | [`lopdf`](https://crates.io/crates/lopdf) | Parse and rebuild PDF object graphs |
+| Rasterization | [`hayro`](https://github.com/LaurenzV/hayro) | Pure-Rust PDF renderer, incl. its own JPEG2000/JBIG2 decoders |
+| Interface | [`egui`](https://github.com/emilk/egui)/`eframe` | Immediate-mode native GUI — no browser, no Electron |
+| Dialogs | [`rfd`](https://crates.io/crates/rfd) | Native Windows file dialogs |
+| CLI | [`clap`](https://crates.io/crates/clap) | Scriptable surface + test harness |
 
-Same core compiles to WASM later — the parked web app (`../app`) eventually becomes a
-thin shell over this exact engine.
+Memory-safe from parse to pixel. The same core compiles to WASM — a future
+web shell can wrap this exact engine.
 
 ## Workspace
 
 ```
 crates/pdfaxe-core   engine: assemble() (merge/extract/reorder/rotate in one primitive),
                      ranges, render (hayro behind a swappable module boundary),
-                     text (positioned runs, in-place edit, find/replace),
-                     stamp (watermark, page numbers — q…Q-sandwiched appends)
-crates/pdfaxe-cli    pdfaxe info|merge|extract|rotate|text|render|runs|edit-text|
-                     watermark|page-numbers
-crates/pdfaxe-app    the Windows GUI (open/drop a PDF — or drop images to build one,
-                     thumbnail page list with reorder/rotate/delete, continuous
-                     multi-page scroll view with zoom + PgUp/PgDn/Home/End, text-edit
-                     mode with click-on-page selection, redact mode with drag-to-box
-                     burning, in-document search (Ctrl+F) with match stepping,
-                     watermark + page-number dialogs, save-as; flags: --dark --edit
-                     --redact --watermark --page-numbers --page N --find TEXT)
-fixtures/            test PDFs (regenerate via ../app/scripts/make-samples.mjs)
+                     text (positioned runs, in-place edit, find/replace, reflow,
+                     re-wrap, font re-embedding), stamp (watermark, page numbers)
+crates/pdfaxe-cli    pdfaxe info|merge|extract|rotate|render|runs|edit-text|redact|
+                     images|watermark|page-numbers
+crates/pdfaxe-app    the Windows GUI (thumbnails with reorder/rotate/delete,
+                     continuous scroll + zoom, text-edit mode, redact mode,
+                     Ctrl+F search, watermark/page-number dialogs, image drop zone)
+fixtures/            test PDFs
+docs/                verification log
+wix/                 MSI installer (WiX) — AGPL dialog, branded art
+ci/                  signing scripts (Azure Trusted Signing)
 ```
 
-Build artifacts go to `$env:USERPROFILE\AppData\Local\pdfaxe-target` (see `.cargo/config.toml`)
-to keep OneDrive from syncing gigabytes of `target/`.
+## Build from source
 
-## Commands
-
-```bash
-cargo test -p pdfaxe-core            # engine tests (11)
-cargo run -p pdfaxe-cli -- info fixtures/sample-a.pdf
-cargo run -p pdfaxe-cli -- merge -o out.pdf a.pdf b.pdf
-cargo run -p pdfaxe-cli -- render fixtures/sample-a.pdf -o page1.png --page 1 --width 1200
-cargo run -p pdfaxe-cli -- runs fixtures/sample-a.pdf          # positioned text runs
-cargo run -p pdfaxe-cli -- edit-text in.pdf -o out.pdf --find "old" --replace "new"
-cargo run -p pdfaxe-cli -- watermark in.pdf -o out.pdf --text "CONFIDENTIAL"
-cargo run -p pdfaxe-cli -- page-numbers in.pdf -o out.pdf --format "{page} / {total}"
-cargo run -p pdfaxe-cli -- redact in.pdf -o out.pdf --page 1 --rect "38,635,130,22"
-cargo run -p pdfaxe-cli -- render in.pdf -o pg.png --pages "1-3" --width 800   # pg-1.png…
-cargo run -p pdfaxe-cli -- images -o out.pdf scan1.jpg scan2.png
-cargo run -p pdfaxe-app              # the app; also: pdfaxe-app.exe some.pdf ("Open with")
-cargo build --release --workspace    # optimized binaries
+```console
+$ cargo test -p pdfaxe-core            # engine tests
+$ cargo run -p pdfaxe-app              # the app
+$ cargo run -p pdfaxe-cli -- info fixtures/sample-a.pdf
+$ cargo build --release --workspace    # optimized binaries
+$ ./build-msi.ps1                      # per-user MSI (WiX 3.14 + cargo-wix)
 ```
 
-## Verified (July 12, 2026)
+Signing runs through `ci/sign.ps1` (Azure Trusted Signing) when
+`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` are present;
+without them the build completes unsigned with a warning.
 
-- 18/18 core tests: merge page counts, extract subset (content lands on right pages),
-  reorder+rotate via assemble, in-place rotate, info, range parsing, text runs with
-  positions, in-place edit, find/replace, unencodable-text rejection, /Differences
-  decode+edit, MacRoman/Standard encodings, symbolic-font read-only, watermark
-  page-targeting, page-number templates, stamped-doc save/reload
-- Watermark + page numbers render-verified: diagonal translucent CONFIDENTIAL through
-  page center (hayro honors the ExtGState alpha), "1 / 5" bottom center, original
-  content intact
-- CLI E2E on fixtures; outputs cross-verified with an independent parser (pdf-lib/Node)
-- Pure-Rust render of a fixture page: fonts, weights, colors, layout all faithful
-- Text edit E2E: `edit-text` replaced SECRET-CODE-42 across 5 pages; hayro render of the
-  output shows the new text at the exact position/font/color of the old
-- GUI launched + screenshot-verified: thumbnail page list (lazy, 2/frame budget), zoom
-  controls (fit-width default, steps, Ctrl+scroll), edit-mode panel listing runs
-- Same-line reflow (July 13): an edit shifts the rest of its line by the real width
-  delta (glyph metrics from /Widths or built-in standard-14 AFM tables) and un-shifts
-  at the next line break; falls back to in-place when widths are unknown or the text
-  matrix is rotated. 27 core tests; render-verified via CLI edit-text + hayro.
-- Watermark + page-numbers GUI dialogs (July 13): screenshot-verified in both themes
-  via `--watermark` / `--page-numbers` deep-link flags; the engine calls beneath the
-  Apply buttons are the same test-covered watermark()/page_numbers() paths.
-- Continuous multi-page scroll (July 13): all pages in one scroll viewport, layout
-  pre-sized from MediaBoxes (`page_sizes()`), 1 rasterization/frame budget, textures
-  evicted outside a viewport-height band, page list follows scroll and vice versa;
-  screenshot-verified via `--page 4` deep-link (viewport and thumbnail both land on
-  page 4).
-- Paragraph re-wrap (July 13): edits redistribute words across the paragraph's
-  existing lines (positions untouched — only strings change), overflow cascades
-  down and shrink pulls words up; recognition requires uniform font/size/margin/
-  leading and near-full lines, so ragged line-lists (addresses) refuse and fall
-  back to same-line reflow. Render-verified: a 40-char-longer replacement wraps
-  onto the next line instead of overflowing the margin.
-- Redaction by raster burn (July 13): the page is re-rendered with the boxes
-  burned black and its content replaced by that bitmap — extract_text on the
-  redacted page returns nothing, other pages untouched, annotations dropped;
-  CLI + render verified (black box exactly over SECRET-CODE-42, ~56 KB page at
-  200 dpi).
-- Images↔PDF (July 13): `images` builds one page per image (JPEG embedded
-  as-is via DCTDecode — lossless; PNG re-encoded Flate RGB, alpha over white),
-  `render --pages "1-3"` exports numbered PNGs; round-trip verified (PDF →
-  PNGs → PDF → faithful render).
-- GUI redact mode + image drop zone + keyboard nav (July 13): drag boxes on
-  any page (live preview, per-box remove, burn button drives the test-covered
-  redact_page), dropping PNG/JPEG files builds and opens a fresh PDF,
-  PgUp/PgDn/Home/End navigate pages. Mode UI screenshot-verified via
-  `--redact`; the drag gesture and drop gesture still need a human hand.
-- In-document search (July 13): Ctrl+F box in the top bar, case-insensitive
-  across all pages' runs, ◀ ▶ match stepping, each jump scrolls to the page
-  and highlights the run. Screenshot-verified via `--find SECRET` (counter
-  1/5, highlight box on the match).
-- Not yet human-verified: click-text-on-page selection + Apply edit in the GUI (engine
-  path underneath is test-covered), dialog Apply buttons end-to-end
+CI runs the test suite and packages an unsigned MSI on every push. Pushing a
+`vX.Y.Z` tag (matching the workspace version) produces a signed build, hard
+signature verification, a SHA-256 checksum, and a **draft** GitHub release for
+human review.
 
 ## Engine notes
 
 - `assemble()` copies inheritable page attributes (Resources/MediaBox/CropBox/Rotate)
   onto each page before re-parenting — the correctness detail naive merges miss.
-- v0 limitation (documented in the fn docs): document-level extras (bookmarks/outlines,
-  AcroForm trees, attachments) aren't carried through `assemble()` yet.
-- hayro is young: encrypted PDFs unsupported, some blend modes missing. It sits behind
-  `pdfaxe_core::render` so a second backend (or PDFium behind a feature flag as a
-  rendering oracle for tests) can be added without touching callers.
+- hayro sits behind `pdfaxe_core::render`, so a second render backend can be
+  added without touching callers.
 
-## Roadmap
+## Known limits
 
-1. **Text editing (the wedge, Phase 1):** ~~v1 shipped~~ — positioned runs, in-place
-   same-font edits, find/replace, `/Encoding` names + `/Differences` + symbolic-font
-   protection (`pdfaxe-core/src/text.rs`). ~~Same-line reflow~~ (`metrics.rs` +
-   `reflow_line`). ~~Paragraph re-wrap~~ (`try_rewrap` — conservative block
-   detection, strings-only redistribution). Next: font re-embedding for arbitrary
-   new glyphs (shaping via `rustybuzz`, font parsing/subsetting via
-   `skrifa`/`klippa`), then cross-block re-wrap (new-line creation).
-2. ~~App~~: ~~thumbnails~~, ~~zoom~~, ~~watermark/page-number dialogs~~,
-   ~~multi-page continuous scroll + texture eviction~~, ~~keyboard navigation~~,
-   ~~redact box-drawing~~, ~~image drop zone~~, ~~search-in-document~~ — done.
-3. ~~More ops at parity with the web suite~~: ~~images→PDF~~, ~~PDF→images~~,
-   ~~watermark~~, ~~page numbers~~, ~~redact~~ — engine, CLI and GUI all done.
-4. ~~Distribution~~: signed per-user MSI with AGPL license dialog, "Open with
-   PDFAxe" association, Start Menu + PATH; CI + tagged releases (see below).
-5. Windows polish: jump lists, recent files, dark mode following system.
+A tool that hides its limits is hiding something:
 
-## Installer + releases
-
-`build-msi.ps1` builds the per-user MSI (WiX 3.14 binaries + `cargo-wix`; set
-`PDFAXE_WIX_BIN` if WiX lives elsewhere). Both exes and the MSI are signed via
-Azure Trusted Signing (`ci/sign.ps1`, override with `LXB_SIGN_SCRIPT`); without
-`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` in the environment the
-build completes unsigned with a warning. The installer opens with the AGPL
-license dialog — `wix/License.rtf` and the dialog art are committed, regenerated
-from `LICENSE` / `assets/logo.png` by `wix/make-license-rtf.ps1` and
-`wix/make-installer-art.ps1`.
-
-CI (`.github/workflows/ci.yml`) runs the test suite and packages an unsigned
-MSI artifact on every push and PR. Pushing a `vX.Y.Z` tag (it must match the
-workspace version in `Cargo.toml`) runs `release.yml`: signed build, hard
-signature verification, sha256 checksum, and a **draft** GitHub release for
-human review before publishing.
+- Encrypted PDFs aren't supported yet (renderer support pending).
+- Bookmarks, form trees, and attachments aren't carried through `assemble()` yet.
+- Windows only, today. The engine is portable; the shell is not, yet.
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Free forever — copyleft guarantees every fork and
-hosted derivative stays open source.
+[AGPL-3.0-or-later](LICENSE). Free forever — copyleft guarantees every fork
+and hosted derivative stays open source.
+
+**Business:** fleet deployment, update waves, identity/policy integration, and
+human support are paid **per deployment — never per seat, never per month**.
+[Talk to us](https://lxb-studio.com/contact/).
+
+---
+
+<p align="center">
+  <a href="https://pdfaxe.app">pdfaxe.app</a> ·
+  © 2026 <a href="https://lxb-studio.com">LXB Studio LLC</a> · Elizabethtown, PA ·
+  <a href="https://lxb-studio.com/contact/">Contact</a>
+</p>
