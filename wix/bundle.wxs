@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Burn bundle: the Setup.exe humans expect, wrapping the exact per-user MSI
+     that fleets deploy. Build with:
+       candle -ext WixBalExtension -dMsiPath=... -dLicenseRtf=... -dIconFile=... bundle.wxs
+       light  -ext WixBalExtension bundle.wixobj -o PDFAxeSetup-vX.Y.Z.exe
+     Signing a bundle is three passes: insignia -ib (detach engine), sign the
+     engine, insignia -ab (reattach), then sign the bundle itself. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension">
+
+  <Bundle Name="PDFAxe"
+          Version="$(var.Version)"
+          Manufacturer="LXB Studio LLC"
+          AboutUrl="https://pdfaxe.app"
+          IconSourceFile="$(var.IconFile)"
+          UpgradeCode="D4A331E5-BEC3-4732-BE51-B1EE06A7486C">
+
+    <BootstrapperApplicationRef Id="WixStandardBootstrapperApplication.RtfLicense">
+      <bal:WixStandardBootstrapperApplication
+          LicenseFile="$(var.LicenseRtf)"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplicationRef>
+
+    <Chain>
+      <!-- DisplayInternalUI=no: the bundle shows the AGPL license itself, so
+           the MSI's own license dialog stays suppressed - no double EULA. -->
+      <MsiPackage SourceFile="$(var.MsiPath)"
+                  DisplayInternalUI="no"
+                  Compressed="yes"
+                  Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

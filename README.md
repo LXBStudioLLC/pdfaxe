@@ -61,8 +61,9 @@ Everything above is shipped and verified — see the
 
 ## Install
 
-Signed per-user MSI (≈11 MB) from **[Releases](https://github.com/LXBStudioLLC/pdfaxe/releases)** —
-first public release lands with the `v0.1.0` tag.
+Signed installers (≈11 MB) from **[Releases](https://github.com/LXBStudioLLC/pdfaxe/releases)**:
+`PDFAxeSetup-vX.Y.Z.exe` for a normal install, or the per-user MSI for
+Intune / SCCM fleet deployment — same app, same signature, either way.
 
 - Signed **LXB Studio LLC** via Azure Trusted Signing
 - SHA-256 checksum published with every release

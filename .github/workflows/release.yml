@@ -79,7 +79,8 @@ jobs:
           $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
           $bin = Join-Path $meta.target_directory "release"
           $msi = Get-ChildItem (Join-Path $meta.target_directory "wix\*.msi") | Sort-Object LastWriteTime | Select-Object -Last 1
-          foreach ($f in (Join-Path $bin "pdfaxe-app.exe"), (Join-Path $bin "pdfaxe-cli.exe"), $msi.FullName) {
+          $setup = Get-ChildItem (Join-Path $meta.target_directory "wix\PDFAxeSetup-v*.exe") | Sort-Object LastWriteTime | Select-Object -Last 1
+          foreach ($f in (Join-Path $bin "pdfaxe-app.exe"), (Join-Path $bin "pdfaxe-cli.exe"), $msi.FullName, $setup.FullName) {
             $sig = Get-AuthenticodeSignature $f
             Write-Host ("{0,-12} {1}" -f $sig.Status, $f)
             if ($sig.Status -ne 'Valid') { throw "NOT VALIDLY SIGNED: $f" }
@@ -87,8 +88,13 @@ jobs:
           $hash = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash.ToLower()
           $sha = "$($msi.FullName).sha256"
           "$hash  $($msi.Name)" | Out-File -FilePath $sha -Encoding ascii
+          $ehash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          $esha = "$($setup.FullName).sha256"
+          "$ehash  $($setup.Name)" | Out-File -FilePath $esha -Encoding ascii
           "MSI_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SHA_PATH=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "EXE_PATH=$($setup.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "EXE_SHA_PATH=$esha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload signed MSI artifact
         uses: actions/upload-artifact@v4
@@ -96,6 +102,7 @@ jobs:
           name: pdfaxe-msi-signed
           path: |
             target/wix/*.msi
+            target/wix/PDFAxeSetup-v*.exe
             target/wix/*.sha256
           if-no-files-found: error
 
@@ -104,4 +111,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME $env:MSI_PATH $env:SHA_PATH --draft --verify-tag --title "PDFAxe $($env:GITHUB_REF_NAME.TrimStart('v'))" --generate-notes
+          gh release create $env:GITHUB_REF_NAME $env:MSI_PATH $env:SHA_PATH $env:EXE_PATH $env:EXE_SHA_PATH --draft --verify-tag --title "PDFAxe $($env:GITHUB_REF_NAME.TrimStart('v'))" --generate-notes

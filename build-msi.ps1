@@ -43,9 +43,32 @@ if ($LASTEXITCODE -ne 0) { throw "cargo wix failed" }
 $msi = Get-ChildItem (Join-Path $meta.target_directory "wix\*.msi") | Sort-Object LastWriteTime | Select-Object -Last 1
 Sign-One $msi.FullName "PDFAxe Installer"
 
+# Burn bundle: the Setup.exe humans expect, wrapping the signed MSI. A bundle
+# cannot be signed flat - detach the burn engine (insignia -ib), sign it,
+# reattach (-ab), then sign the bundle itself.
+$version = ($meta.packages | Where-Object { $_.name -eq 'pdfaxe-app' }).version
+$wixOut = Join-Path $meta.target_directory "wix"
+$setupExe = Join-Path $wixOut "PDFAxeSetup-v$version.exe"
+& "$wix\candle.exe" -nologo -ext WixBalExtension "-dVersion=$version" `
+    "-dMsiPath=$($msi.FullName)" "-dLicenseRtf=$PSScriptRoot\wix\License.rtf" `
+    "-dIconFile=$PSScriptRoot\assets\pdfaxe.ico" `
+    -out (Join-Path $wixOut "bundle.wixobj") "$PSScriptRoot\wix\bundle.wxs"
+if ($LASTEXITCODE -ne 0) { throw "candle bundle failed" }
+& "$wix\light.exe" -nologo -ext WixBalExtension -out $setupExe (Join-Path $wixOut "bundle.wixobj")
+if ($LASTEXITCODE -ne 0) { throw "light bundle failed" }
+$engine = Join-Path $wixOut "burn-engine.exe"
+& "$wix\insignia.exe" -nologo -ib $setupExe -o $engine
+if ($LASTEXITCODE -ne 0) { throw "insignia detach failed" }
+Sign-One $engine "PDFAxe"
+& "$wix\insignia.exe" -nologo -ab $engine $setupExe -o $setupExe
+if ($LASTEXITCODE -ne 0) { throw "insignia reattach failed" }
+Remove-Item $engine
+Sign-One $setupExe "PDFAxe Installer"
+
 Write-Host ""
-foreach ($f in (Join-Path $bin "pdfaxe-app.exe"), (Join-Path $bin "pdfaxe-cli.exe"), $msi.FullName) {
+foreach ($f in (Join-Path $bin "pdfaxe-app.exe"), (Join-Path $bin "pdfaxe-cli.exe"), $msi.FullName, $setupExe) {
     $sig = Get-AuthenticodeSignature $f
     Write-Host ("{0,-12} {1}" -f $sig.Status, $f)
 }
 Write-Host "MSI: $($msi.FullName)"
+Write-Host "EXE: $setupExe"
