@@ -14,6 +14,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# rustsec/audit-check publishes its findings as a check run.
+permissions:
+  contents: read
+  checks: write
+
 defaults:
   run:
     shell: powershell
