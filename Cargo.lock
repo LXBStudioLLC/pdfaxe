@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "pdfaxe-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2861,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "pdfaxe-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "pdfaxe-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flate2",

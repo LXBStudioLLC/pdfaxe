@@ -1,6 +1,6 @@
 [package]
 name = "pdfaxe-app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license.workspace = true
 
@@ -10,5 +10,5 @@ winresource = "0.1"
 [dependencies]
 anyhow = "1.0.103"
 eframe = "0.35.0"
-pdfaxe-core = { version = "0.1.0", path = "../pdfaxe-core" }
+pdfaxe-core = { version = "0.2.0", path = "../pdfaxe-core" }
 rfd = "0.17.2"
