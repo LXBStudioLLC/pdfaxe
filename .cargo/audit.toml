@@ -1,0 +1,14 @@
+# cargo-audit configuration (also honored by rustsec/audit-check in CI).
+#
+# Every ignore below names the reason it is acceptable. Re-check them when
+# bumping eframe/winit: the goal is an empty list.
+
+[advisories]
+ignore = [
+    # quick-xml 0.39 (quadratic attribute check / NsReader allocation).
+    # Pulled in only by wayland-scanner, a Linux-Wayland build-time
+    # proc-macro behind winit; never compiled for the Windows targets we
+    # ship, and winit/smithay pin the 0.39 line so cargo update can't move it.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

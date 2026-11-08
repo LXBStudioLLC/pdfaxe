@@ -58,6 +58,9 @@ fn load_image(path: &Path) -> Result<PdfImage> {
     let bytes = std::fs::read(path).with_context(|| format!("couldn't read {}", path.display()))?;
 
     if let Some((width, height, ncomp)) = jpeg_info(&bytes) {
+        if width == 0 || height == 0 {
+            return Err(anyhow!("{} declares a zero-size JPEG frame", path.display()));
+        }
         let colorspace = match ncomp {
             1 => "DeviceGray",
             3 => "DeviceRGB",
@@ -79,6 +82,9 @@ fn load_image(path: &Path) -> Result<PdfImage> {
     let mut buf = vec![0u8; buf_size];
     let info = reader.next_frame(&mut buf).map_err(|e| anyhow!("couldn't decode {}: {e}", path.display()))?;
     buf.truncate(info.buffer_size());
+    if info.width == 0 || info.height == 0 {
+        return Err(anyhow!("{} has no pixels", path.display()));
+    }
 
     // Normalize every variant to RGB, alpha composited over white.
     let rgb: Vec<u8> = match info.color_type {

@@ -61,8 +61,88 @@ through hayro with outputs cross-checked by an independent parser
   and highlights the run. Screenshot-verified via `--find SECRET` (counter
   1/5, highlight box on the match).
 
+## November 8, 2026 — audit response
+
+Three independent code audits landed this week; two of them proved the same
+Critical bug. Everything below was fixed and is now test-covered (61 core
+tests, up from 40).
+
+- **Redaction leak (Critical).** `redact_page` replaced the page's /Contents
+  but never removed the old stream, and the CLI save path never pruned, so a
+  "redacted" file still carried the original page as an unreferenced object.
+  Reproduced before the fix with a raw-object scan of the CLI output (5
+  streams held the marker; the orphan was byte-identical to the original
+  page). Fix: the page dictionary is rebuilt from scratch (dropping /Annots,
+  /Thumb, /StructParents, /PieceInfo and the rest), form fields whose widgets
+  lived on the page are detached from the AcroForm, the tag tree is dropped,
+  and `prune_objects()` runs inside `redact_page` itself. Regression test
+  decompresses every object of a plain `save_to` output and asserts the
+  marker survives on exactly the four untouched pages. Re-verified through
+  the CLI binary after the fix: 4 streams, zero orphans.
+- **Redaction scrub options.** `redact_pages` + `RedactOpts`: Info/XMP/
+  PieceInfo stripped and bookmarks to burned pages removed by default; CLI
+  `--keep-metadata` / `--keep-bookmarks`, GUI checkboxes. New `scrub` CLI
+  command and GUI "Strip metadata" button. Tests cover both the default and
+  the opt-out.
+- **GUI save destroyed forms/bookmarks/metadata (High).** `assemble` wrote a
+  bare catalog. It now carries the AcroForm (fields filtered to kept pages,
+  /Fields and /CO merged across sources, DR merged), outlines (concatenated
+  at the top level, named destinations rewritten to explicit ones, entries to
+  dropped pages made inert, /Count recomputed), attachments (flat
+  /EmbeddedFiles tree), Info, XMP, viewer prefs, page layout/mode, language,
+  OCProperties, OpenAction, and PageLabels for identity saves — and nulls
+  every reference to a dropped page before pruning, so a bookmark can no
+  longer keep a removed page's content alive. Tests: identity save keeps all
+  three fixture fields + Info + XMP; subset extract filters a page-2 field
+  and leaks none of page 2; bookmarks sanitize; two-document merge
+  concatenates outlines and attachments. CLI `extract`/`merge` re-verified
+  against `sample-form.pdf`: AcroForm present in the output.
+- **GUI save lifecycle (High).** Save now assembles from the live `Document`
+  (not a possibly stale byte snapshot), re-opens the saved file so the title,
+  path and dirty flag describe what is on disk, and is atomic (temp file +
+  rename). Added Save / Ctrl+S (overwrites the opened file; falls back to
+  Save as… for unsaved image builds), an unsaved-changes prompt on window
+  close (Yes / No / Cancel via `close_requested` + `CancelClose`), and
+  `(edited)` resets after a save. Re-serialization failures are surfaced in
+  the status bar instead of swallowed.
+- **Display geometry (Medium).** New `PageView` (CropBox ∩ MediaBox +
+  /Rotate) maps user space ↔ display space. Used by the GUI (click-to-select,
+  highlight boxes, redaction boxes), by `redact_page` (burn target and
+  rebuilt page size follow the renderer), and by stamps (page numbers land
+  at the displayed bottom centre of rotated/cropped pages, upright). Tests:
+  round-trip mapping for all four rotations; renderer dimensions agree with
+  `page_sizes` on a rotated, cropped, offset-origin page; a redaction on a
+  rotated+cropped page burns exactly where the viewer shows the text (render
+  verified).
+- **Text engine (Medium).** ToUnicode parser rewritten as a tokenizer:
+  array-form `bfrange`, `codespacerange`, `<< >>` dictionaries and
+  `/glyphname` destinations no longer corrupt mappings. `text_runs` tracks
+  `q`/`Q`/`cm` and the full text matrix (positions and widths are now true
+  user-space values; `display_size` reports the rendered size), recurses into
+  form XObjects (`Do`) with their /Matrix and own resources — those runs are
+  listed and searchable, read-only, and `edit_run` refuses them with a clear
+  message. Type3 fonts measure through /FontMatrix and decode only through
+  /Differences. `find_replace` counts occurrences, not runs, and rejects an
+  empty needle.
+- **Smaller fixes.** Search results re-run after every edit (stale run
+  indices); search jumps show the match preview; mixed drag-drop opens the
+  PDF and says what was ignored; `--find`/`--page` without a document warn
+  instead of silently doing nothing; redact drag commits on release outside
+  the page; burn DPI selectable (150/200/300); dead code removed (the
+  "preview" field is used, the deep orange is the Burn button); Courier
+  matched by family not prefix; JPEG zero-size guard; font walk depth 6;
+  `render --pages` reads the file once; site demo commands are now valid
+  invocations (`-o`); site download links pinned to the v0.1.0 release URL;
+  `cargo audit` added to CI with documented exceptions.
+- **Verification performed:** `cargo test --workspace` 61/61; `cargo build
+  --workspace` zero warnings; CLI redact/extract/merge/scrub/edit-text E2E
+  on fixtures with an independent raw-object scanner; GUI smoke launch with
+  `--redact --page 3 --find SECRET` deep links.
+
 ## Still awaiting human-in-the-loop verification
 
-- Click-text-on-page selection + Apply edit in the GUI (engine path underneath
-  is test-covered)
+- Save / Ctrl+S / Save as… round trip and the close-prompt dialog
+- Redact drag gesture (incl. release outside the window) and the Burn button
+  with the metadata/bookmark options
+- Click-text-on-page selection + Apply edit on rotated and cropped pages
 - Dialog Apply buttons end-to-end

@@ -97,6 +97,12 @@ pub fn primary_button(text: &str) -> egui::Button<'static> {
         .fill(AXE_ORANGE)
 }
 
+/// Deeper orange for actions that destroy content (burning redactions).
+pub fn danger_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.to_owned()).color(Color32::WHITE).strong())
+        .fill(AXE_ORANGE_DEEP)
+}
+
 /// The PDF**Axe** wordmark as a two-color layout job.
 pub fn wordmark(size: f32, text_color: Color32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();

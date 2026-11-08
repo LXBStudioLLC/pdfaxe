@@ -44,8 +44,8 @@ their subscription. PDFAxe is the opposite bet:
 | # | Operation | Surface | Notes |
 |---|---|---|---|
 | 01 | `edit-text` | GUI · CLI | In-place: same font, same position; reflow + re-wrap + font re-embedding |
-| 02 | `redact` | GUI · CLI | Raster burn — pixels destroyed; extraction of a redacted page returns nothing |
-| 03 | `merge` | CLI | Inheritable page attributes carried correctly |
+| 02 | `redact` | GUI · CLI | Raster burn — pixels destroyed. The burned page's original content, annotations, form fields and thumbnail leave the *file*, not just the page tree (object-level test); metadata and bookmarks to it go too |
+| 03 | `merge` | CLI | Inheritable page attributes carried correctly; forms, bookmarks, attachments and metadata ride along |
 | 04 | `extract` | CLI | Page ranges into new documents |
 | 05 | `reorder` / `rotate` | GUI · CLI | One `assemble()` primitive under both |
 | 06 | `watermark` | GUI · CLI | Diagonal translucent stamp, alpha honored |
@@ -55,6 +55,7 @@ their subscription. PDFAxe is the opposite bet:
 | 10 | search | GUI | Ctrl+F across all pages with match stepping |
 | 11 | `info` / `runs` | CLI | Object-level inspection, positioned text runs |
 | 12 | Open-with | shell | `.pdf` association, drag-and-drop files or images |
+| 13 | `scrub` | GUI · CLI | Strip the Info dictionary, XMP and app-private metadata |
 
 Everything above is shipped and verified — see the
 [verification log](docs/VERIFICATION.md) for exactly how.
@@ -80,6 +81,8 @@ $ pdfaxe merge -o out.pdf a.pdf b.pdf
 $ pdfaxe extract in.pdf -o part.pdf --pages "2-5"
 $ pdfaxe edit-text in.pdf -o out.pdf --find "DRAFT" --replace "FINAL"
 $ pdfaxe redact in.pdf -o out.pdf --page 1 --rect "38,635,130,22"
+$ pdfaxe redact in.pdf -o out.pdf --pages "1-3" --rect "38,635,130,22" --keep-bookmarks
+$ pdfaxe scrub in.pdf -o out.pdf
 $ pdfaxe watermark in.pdf -o out.pdf --text "CONFIDENTIAL"
 $ pdfaxe page-numbers in.pdf -o out.pdf --format "{page} / {total}"
 $ pdfaxe images -o out.pdf scan1.jpg scan2.png
@@ -102,15 +105,19 @@ web shell can wrap this exact engine.
 ## Workspace
 
 ```
-crates/pdfaxe-core   engine: assemble() (merge/extract/reorder/rotate in one primitive),
-                     ranges, render (hayro behind a swappable module boundary),
-                     text (positioned runs, in-place edit, find/replace, reflow,
-                     re-wrap, font re-embedding), stamp (watermark, page numbers)
+crates/pdfaxe-core   engine: assemble() (merge/extract/reorder/rotate in one primitive,
+                     carrying forms/bookmarks/attachments/metadata), carry + scrub
+                     (document-level structures), ranges, render (hayro behind a
+                     swappable module boundary), text (positioned runs incl. form
+                     XObjects, in-place edit, find/replace, reflow, re-wrap, font
+                     re-embedding), stamp (watermark, page numbers), redact
 crates/pdfaxe-cli    pdfaxe info|merge|extract|rotate|render|runs|edit-text|redact|
-                     images|watermark|page-numbers
+                     scrub|images|watermark|page-numbers
 crates/pdfaxe-app    the Windows GUI (thumbnails with reorder/rotate/delete,
-                     continuous scroll + zoom, text-edit mode, redact mode,
-                     Ctrl+F search, watermark/page-number dialogs, image drop zone)
+                     continuous scroll + zoom, text-edit mode, redact mode with
+                     metadata/bookmark scrub options, Ctrl+F search, Save / Save as
+                     with an unsaved-changes guard, watermark/page-number dialogs,
+                     strip-metadata, image drop zone)
 fixtures/            test PDFs
 docs/                verification log
 wix/                 MSI installer (WiX) — AGPL dialog, branded art
@@ -140,6 +147,18 @@ human review.
 
 - `assemble()` copies inheritable page attributes (Resources/MediaBox/CropBox/Rotate)
   onto each page before re-parenting — the correctness detail naive merges miss.
+  It also carries the AcroForm tree (filtered to kept pages), outlines (named
+  destinations rewritten to explicit ones; entries to dropped pages go inert),
+  attachments, Info/XMP, viewer preferences and optional-content config — and
+  nulls every reference to a dropped page so its content can't ride along.
+- Redaction guarantees are enforced at the object level: the page dictionary is
+  rebuilt from scratch, form fields whose widgets lived on the page leave the
+  AcroForm, the tag tree is dropped, and unreachable objects are pruned *inside*
+  `redact_page()` — so no save path can ship the old content as an orphan.
+- Geometry is display-space aware: `PageView` maps between user space (text
+  runs) and the page as shown (CropBox ∩ MediaBox, /Rotate), so clicks,
+  highlights, redaction boxes and stamps land where the viewer shows them.
+- Every save is atomic (write to a sibling temp file, then rename).
 - hayro sits behind `pdfaxe_core::render`, so a second render backend can be
   added without touching callers.
 
@@ -148,7 +167,10 @@ human review.
 A tool that hides its limits is hiding something:
 
 - Encrypted PDFs aren't supported yet (renderer support pending).
-- Bookmarks, form trees, and attachments aren't carried through `assemble()` yet.
+- Text drawn through form XObjects is listed and searchable, but not editable
+  in place yet.
+- The tagged-PDF structure tree isn't carried through `assemble()`, and
+  redaction drops it on purpose (it can hold text alternates).
 - Windows only, today. The engine is portable; the shell is not, yet.
 
 ## License

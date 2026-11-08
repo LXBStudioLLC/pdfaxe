@@ -4,12 +4,17 @@
 //! graphics state (transforms, clips) can't displace the stamp, and each stamp
 //! is isolated the same way. Text uses Helvetica (standard-14, no embedding
 //! needed) with WinAnsi bytes; non-encodable characters degrade to '?'.
+//!
+//! Placement is computed in *display space* — the page as the viewer shows
+//! it, CropBox and /Rotate applied — and mapped back into user space, so a
+//! "bottom centre" page number lands at the displayed bottom of a rotated or
+//! cropped page and reads upright.
 
 use anyhow::{anyhow, Result};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
-use crate::ops::{page_media_box, resolve_inherited};
+use crate::ops::{page_view_for, resolve_inherited};
 
 const STAMP_FONT_RES: &str = "PAXHelv";
 const STAMP_GS_RES: &str = "PAXGs";
@@ -21,7 +26,7 @@ pub struct StampOpts {
     pub gray: f32,
     /// Fill alpha 0.0..1.0 (via ExtGState; 1.0 skips the gstate entirely).
     pub alpha: f32,
-    /// Counter-clockwise rotation in degrees.
+    /// Counter-clockwise rotation in degrees, as seen on screen.
     pub angle: f32,
 }
 
@@ -52,19 +57,24 @@ pub fn watermark(doc: &mut Document, pages: &[u32], text: &str, opts: &StampOpts
     let rad = opts.angle.to_radians();
     for page_id in targets {
         ensure_stamp_resources(doc, page_id, font_id, gs_id)?;
-        let (x0, y0, x1, y1) = page_media_box(doc, page_id);
-        // Baseline start: half the text length back from the page center,
-        // along the rotated baseline direction.
-        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        let x = cx - (w / 2.0) * rad.cos();
-        let y = cy - (w / 2.0) * rad.sin();
-        append_stamp(doc, page_id, stamp_ops(bytes.clone(), x, y, opts, gs_id.is_some()))?;
+        let view = page_view_for(doc, page_id);
+        let (dw, dh) = view.display_size();
+        // Baseline start in display space: half the text length back from
+        // the displayed centre along the baseline direction; then into user
+        // space, counter-rotating the text by the page's /Rotate so it reads
+        // at the requested angle on screen.
+        let (cx, cy) = (dw / 2.0, dh / 2.0);
+        let dx = cx - (w / 2.0) * rad.cos();
+        let dy = cy - (w / 2.0) * rad.sin();
+        let (x, y) = view.from_display(dx, dy);
+        let placed = StampOpts { angle: opts.angle + view.rotate as f32, ..*opts };
+        append_stamp(doc, page_id, stamp_ops(bytes.clone(), x, y, &placed, gs_id.is_some()))?;
     }
     Ok(())
 }
 
-/// Stamp a label on every page, bottom center. `template` may use `{page}`
-/// and `{total}`. Returns the number of pages stamped.
+/// Stamp a label on every page, bottom center as displayed. `template` may
+/// use `{page}` and `{total}`. Returns the number of pages stamped.
 pub fn page_numbers(doc: &mut Document, template: &str, opts: &StampOpts) -> Result<u32> {
     let page_map = doc.get_pages();
     let total = page_map.len() as u32;
@@ -76,10 +86,13 @@ pub fn page_numbers(doc: &mut Document, template: &str, opts: &StampOpts) -> Res
             .replace("{page}", &n.to_string())
             .replace("{total}", &total.to_string());
         ensure_stamp_resources(doc, page_id, font_id, None)?;
-        let (x0, y0, x1, _) = page_media_box(doc, page_id);
-        let x = (x0 + x1) / 2.0 - approx_width(&label, opts.size) / 2.0;
-        let y = y0 + 24.0;
-        append_stamp(doc, page_id, stamp_ops(winansi_bytes(&label), x, y, &opts, false))?;
+        let view = page_view_for(doc, page_id);
+        let (dw, _) = view.display_size();
+        let dx = dw / 2.0 - approx_width(&label, opts.size) / 2.0;
+        let dy = 24.0;
+        let (x, y) = view.from_display(dx, dy);
+        let placed = StampOpts { angle: view.rotate as f32, ..opts };
+        append_stamp(doc, page_id, stamp_ops(winansi_bytes(&label), x, y, &placed, false))?;
     }
     Ok(total)
 }
@@ -258,5 +271,32 @@ mod tests {
         let reloaded = Document::load_mem(&buf).unwrap();
         let text = crate::ops::extract_text(&reloaded, 1).unwrap();
         assert!(text.contains("DRAFT"));
+    }
+
+    #[test]
+    fn page_numbers_land_at_the_displayed_bottom_of_rotated_and_cropped_pages() {
+        let mut doc = load(fixture("sample-a.pdf")).unwrap();
+        crate::ops::rotate_pages(&mut doc, &[2], 90).unwrap();
+        {
+            let p3 = doc.get_pages()[&3];
+            let page = doc.get_dictionary_mut(p3).unwrap();
+            page.set("CropBox", vec![40.into(), 60.into(), 500.into(), 800.into()]);
+        }
+        let opts = StampOpts { size: 10.0, gray: 0.33, ..Default::default() };
+        page_numbers(&mut doc, "{page}", &opts).unwrap();
+        for (page, label) in [(2u32, "2"), (3u32, "3")] {
+            let view = crate::ops::page_view(&doc, page).unwrap();
+            let (dw, _) = view.display_size();
+            let runs = crate::text::text_runs(&doc, page).unwrap();
+            let stamp = runs.iter().find(|r| r.text == label && r.font_res == STAMP_FONT_RES).expect("stamp run");
+            let (dx, dy) = view.to_display(stamp.x, stamp.y);
+            assert!((dy - 24.0).abs() < 0.5, "page {page}: baseline must sit 24pt above the displayed bottom, got {dy}");
+            let want_x = dw / 2.0 - approx_width(label, 10.0) / 2.0;
+            assert!((dx - want_x).abs() < 0.5, "page {page}: centred on the displayed width, got {dx} want {want_x}");
+        }
+        // Rendering still works after the rotation-aware stamp.
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        crate::render::render_page_rgba(&buf, 2, 300).unwrap();
     }
 }

@@ -10,8 +10,8 @@ use pdfaxe_core::lopdf::Document;
 use pdfaxe_core::render::render_page_rgba;
 use pdfaxe_core::text::{edit_run, text_runs, TextRun};
 use pdfaxe_core::{
-    assemble, images_to_pdf, info, load, page_numbers, parse_ranges, redact_page, save,
-    watermark, PageSel, RedactRect, StampOpts,
+    assemble, images_to_pdf, info, load, page_numbers, page_views, parse_ranges, redact_pages, save,
+    strip_metadata, watermark, PageSel, PageView, RedactOpts, RedactRect, StampOpts, StripReport,
 };
 
 /// Thumbnail raster width, pixels.
@@ -46,7 +46,14 @@ fn main() -> eframe::Result {
                     app.open_path(path);
                 }
             }
-            if let Some(ix) = args.iter().position(|a| a == "--page") {
+            let wants_page = args.iter().position(|a| a == "--page");
+            let wants_find = args.iter().position(|a| a == "--find");
+            if app.open.is_none() && (wants_page.is_some() || wants_find.is_some()) {
+                let msg = "--page / --find ignored: no PDF was opened (pass a .pdf path first)";
+                eprintln!("pdfaxe: {msg}");
+                app.status = msg.to_owned();
+            }
+            if let Some(ix) = wants_page {
                 if let Some(n) = args.get(ix + 1).and_then(|v| v.parse::<usize>().ok()) {
                     if let Some(open) = app.open.as_mut() {
                         let i = n.saturating_sub(1).min(open.rows.len().saturating_sub(1));
@@ -55,11 +62,13 @@ fn main() -> eframe::Result {
                     }
                 }
             }
-            if let Some(ix) = args.iter().position(|a| a == "--find") {
+            if let Some(ix) = wants_find {
                 if let Some(q) = args.get(ix + 1) {
-                    app.search_query = q.clone();
-                    app.run_search();
-                    app.jump_to_hit();
+                    if app.open.is_some() {
+                        app.search_query = q.clone();
+                        app.run_search();
+                        app.jump_to_hit();
+                    }
                 }
             }
             Ok(Box::new(app))
@@ -83,7 +92,10 @@ fn search_box_id() -> egui::Id {
 }
 
 struct OpenDoc {
+    /// Where the document lives — a real file when `on_disk`, otherwise a
+    /// placeholder name for an unsaved build (images → PDF).
     path: PathBuf,
+    on_disk: bool,
     /// Serialized current state — feeds the renderer; refreshed after edits.
     bytes: Vec<u8>,
     doc: Document,
@@ -95,7 +107,11 @@ struct OpenDoc {
     /// Thumbnails the page list wants rendered (refilled every frame).
     thumb_wants: Vec<u32>,
     thumb_failed: HashSet<u32>,
+    /// Display size (w, h) in points per source page — CropBox and /Rotate applied.
     page_points: HashMap<u32, (f32, f32)>,
+    /// Display geometry per source page: maps between user space (text runs)
+    /// and display space (mouse, redaction boxes).
+    views: HashMap<u32, PageView>,
     render_errors: HashMap<u32, String>,
     runs_cache: HashMap<u32, Vec<TextRun>>,
     selected_run: Option<usize>,
@@ -103,10 +119,12 @@ struct OpenDoc {
     edited: bool,
     /// Row the view should scroll to (set by thumbnail clicks, one frame).
     scroll_to: Option<usize>,
-    /// Pending redaction boxes: (src page, box in page points).
+    /// Pending redaction boxes: (src page, box in display points).
     redact_boxes: Vec<(u32, RedactRect)>,
-    /// In-progress box drag: (src page, start point in page points).
-    redact_drag: Option<(u32, (f32, f32))>,
+    /// In-progress box drag: (src page, start, current) in display points.
+    /// The current point is tracked every frame so a release outside the
+    /// window still commits the box where the pointer last was.
+    redact_drag: Option<(u32, (f32, f32), (f32, f32))>,
 }
 
 impl OpenDoc {
@@ -118,10 +136,16 @@ impl OpenDoc {
         self.runs_cache.remove(&page);
     }
 
-    fn refresh_bytes(&mut self) {
+    /// Re-serialize the document for the renderer. A failure is reported,
+    /// not swallowed: the preview would otherwise silently show stale pages.
+    fn refresh_bytes(&mut self) -> Result<(), String> {
         let mut buf = Vec::new();
-        if self.doc.save_to(&mut buf).is_ok() {
-            self.bytes = buf;
+        match self.doc.save_to(&mut buf) {
+            Ok(()) => {
+                self.bytes = buf;
+                Ok(())
+            }
+            Err(e) => Err(format!("couldn't re-serialize the document for preview: {e}")),
         }
     }
 
@@ -132,6 +156,25 @@ impl OpenDoc {
         self.thumb_failed.clear();
         self.render_errors.clear();
         self.runs_cache.clear();
+    }
+
+    /// Recompute per-page display geometry (after anything that can change
+    /// a page's box or rotation, e.g. a redaction burn).
+    fn recompute_geometry(&mut self) {
+        self.page_points.clear();
+        self.views.clear();
+        for (i, v) in page_views(&self.doc).into_iter().enumerate() {
+            let p = i as u32 + 1;
+            self.page_points.insert(p, v.display_size());
+            self.views.insert(p, v);
+        }
+    }
+
+    fn view(&self, page: u32) -> PageView {
+        self.views.get(&page).copied().unwrap_or_else(|| {
+            let (w, h) = self.page_points.get(&page).copied().unwrap_or((595.0, 842.0));
+            PageView { x0: 0.0, y0: 0.0, w, h, rotate: 0 }
+        })
     }
 }
 
@@ -153,6 +196,23 @@ fn zoom_out(cur: f32) -> f32 {
     ZOOM_LEVELS.iter().rev().copied().find(|&z| z < cur * 0.99).unwrap_or(0.5)
 }
 
+fn describe_strip(rep: &StripReport) -> String {
+    let mut parts = Vec::new();
+    if rep.info {
+        parts.push("Info dictionary".to_owned());
+    }
+    if rep.xmp {
+        parts.push("XMP metadata".to_owned());
+    }
+    if rep.piece_info > 0 {
+        parts.push(format!("{} app-private dict(s)", rep.piece_info));
+    }
+    if rep.page_metadata > 0 {
+        parts.push(format!("{} page metadata stream(s)", rep.page_metadata));
+    }
+    parts.join(", ")
+}
+
 struct PdfaxeApp {
     open: Option<OpenDoc>,
     status: String,
@@ -169,6 +229,11 @@ struct PdfaxeApp {
     search_query: String,
     search_results: Vec<SearchHit>,
     search_pos: usize,
+    /// Set after an edit so the search re-runs against the new text (runs
+    /// and indices shift under reflow / re-wrap / redaction).
+    search_dirty: bool,
+    /// The user chose to close without saving; don't ask again this frame.
+    allow_close: bool,
     // Watermark dialog state.
     wm_open: bool,
     wm_text: String,
@@ -182,6 +247,10 @@ struct PdfaxeApp {
     pn_template: String,
     pn_size: f32,
     pn_gray: f32,
+    // Redaction options.
+    redact_dpi: f32,
+    redact_strip_metadata: bool,
+    redact_prune_bookmarks: bool,
 }
 
 impl Default for PdfaxeApp {
@@ -199,6 +268,8 @@ impl Default for PdfaxeApp {
             search_query: String::new(),
             search_results: Vec::new(),
             search_pos: 0,
+            search_dirty: false,
+            allow_close: false,
             wm_open: false,
             wm_text: "CONFIDENTIAL".into(),
             wm_pages: String::new(),
@@ -210,22 +281,19 @@ impl Default for PdfaxeApp {
             pn_template: "{page} / {total}".into(),
             pn_size: 10.0,
             pn_gray: 0.35,
+            redact_dpi: 200.0,
+            redact_strip_metadata: true,
+            redact_prune_bookmarks: true,
         }
     }
 }
 
 impl PdfaxeApp {
-    fn install_doc(&mut self, path: PathBuf, doc: Document, bytes: Vec<u8>) {
+    fn install_doc(&mut self, path: PathBuf, on_disk: bool, doc: Document, bytes: Vec<u8>) {
         let pages = info(&doc).pages;
-        // MediaBox dims up front so the scroll layout is stable before any
-        // page has rendered.
-        let page_points: HashMap<u32, (f32, f32)> = pdfaxe_core::page_sizes(&doc)
-            .into_iter()
-            .enumerate()
-            .map(|(i, wh)| (i as u32 + 1, wh))
-            .collect();
-        self.open = Some(OpenDoc {
+        let mut open = OpenDoc {
             path,
+            on_disk,
             bytes,
             doc,
             rows: (1..=pages).map(|p| Row { src_page: p, rotation: 0 }).collect(),
@@ -234,7 +302,8 @@ impl PdfaxeApp {
             thumbs: HashMap::new(),
             thumb_wants: Vec::new(),
             thumb_failed: HashSet::new(),
-            page_points,
+            page_points: HashMap::new(),
+            views: HashMap::new(),
             render_errors: HashMap::new(),
             runs_cache: HashMap::new(),
             selected_run: None,
@@ -243,7 +312,13 @@ impl PdfaxeApp {
             scroll_to: None,
             redact_boxes: Vec::new(),
             redact_drag: None,
-        });
+        };
+        // Display geometry up front so the scroll layout is stable before
+        // any page has rendered.
+        open.recompute_geometry();
+        self.open = Some(open);
+        self.search_results.clear();
+        self.search_pos = 0;
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -254,7 +329,7 @@ impl PdfaxeApp {
         match loaded {
             Ok((doc, bytes)) => {
                 self.status = format!("Opened {} ({} pages)", path.display(), info(&doc).pages);
-                self.install_doc(path, doc, bytes);
+                self.install_doc(path, true, doc, bytes);
             }
             Err(e) => self.status = format!("Couldn't open: {e:#}"),
         }
@@ -278,8 +353,8 @@ impl PdfaxeApp {
             for (i, run) in runs.iter().enumerate() {
                 if run.text.to_lowercase().contains(&q) {
                     let mut preview = run.text.trim().to_owned();
-                    if preview.len() > 48 {
-                        preview.truncate(48);
+                    if preview.chars().count() > 48 {
+                        preview = preview.chars().take(48).collect();
                         preview.push('…');
                     }
                     self.search_results.push(SearchHit { page: p, run: i, preview });
@@ -290,6 +365,21 @@ impl PdfaxeApp {
             0 => format!("No matches for {:?}", self.search_query.trim()),
             n => format!("{n} match(es) for {:?}", self.search_query.trim()),
         };
+    }
+
+    /// Re-run the current search after the document changed, keeping the
+    /// user's place in the result list where possible.
+    fn rerun_search(&mut self) {
+        if self.search_query.trim().is_empty() {
+            self.search_results.clear();
+            self.search_pos = 0;
+            return;
+        }
+        let keep = self.search_pos;
+        let old_status = std::mem::take(&mut self.status);
+        self.run_search();
+        self.status = old_status;
+        self.search_pos = keep.min(self.search_results.len().saturating_sub(1));
     }
 
     /// Scroll to and highlight the current search hit.
@@ -306,6 +396,13 @@ impl PdfaxeApp {
             .and_then(|r| r.get(hit.run))
             .map(|r| r.text.clone())
             .unwrap_or_default();
+        self.status = format!(
+            "Match {}/{} · page {} · {}",
+            self.search_pos + 1,
+            self.search_results.len(),
+            hit.page,
+            hit.preview
+        );
     }
 
     /// Build a PDF from dropped image files and open it, unsaved.
@@ -322,7 +419,7 @@ impl PdfaxeApp {
                     info(&doc).pages,
                     imgs.len()
                 );
-                self.install_doc(PathBuf::from("images.pdf"), doc, bytes);
+                self.install_doc(PathBuf::from("images.pdf"), false, doc, bytes);
             }
             Err(e) => self.status = format!("Couldn't build PDF from images: {e:#}"),
         }
@@ -334,36 +431,117 @@ impl PdfaxeApp {
         }
     }
 
-    fn save_as(&mut self) {
-        let Some(open) = &self.open else { return };
+    /// Assemble the current state (page order, rotations, deletions, every
+    /// edit) and write it to `out`, then re-open the saved file so the view,
+    /// the title and the dirty flag all describe what is on disk.
+    fn write_document(&mut self, out: PathBuf) -> bool {
+        let Some(open) = &self.open else { return false };
         if open.rows.is_empty() {
             self.status = "All pages are deleted — nothing to save.".into();
+            return false;
+        }
+        let sels: Vec<PageSel> = open
+            .rows
+            .iter()
+            .map(|r| PageSel { page: r.src_page, extra_rotation: r.rotation })
+            .collect();
+        let keep_selected = open.selected;
+        let result = assemble(vec![(open.doc.clone(), sels)]).and_then(|mut doc| {
+            save(&mut doc, &out)?;
+            Ok(info(&doc).pages)
+        });
+        match result {
+            Ok(pages) => {
+                match load(&out).and_then(|doc| Ok((doc, std::fs::read(&out)?))) {
+                    Ok((doc, bytes)) => {
+                        self.install_doc(out.clone(), true, doc, bytes);
+                        if let Some(o) = &mut self.open {
+                            o.selected = keep_selected.min(o.rows.len().saturating_sub(1));
+                            o.scroll_to = Some(o.selected);
+                        }
+                    }
+                    Err(e) => {
+                        // Saved fine but couldn't re-read: keep working on the
+                        // in-memory state, but it is no longer dirty.
+                        if let Some(o) = &mut self.open {
+                            o.edited = false;
+                            o.path = out.clone();
+                            o.on_disk = true;
+                        }
+                        self.status = format!("Saved {} but couldn't re-open it: {e:#}", out.display());
+                        return true;
+                    }
+                }
+                self.status = format!("Saved {} ({pages} pages)", out.display());
+                self.rerun_search();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Save failed: {e:#}");
+                false
+            }
+        }
+    }
+
+    fn save_as(&mut self) -> bool {
+        let Some(open) = &self.open else { return false };
+        let suggested = if open.on_disk {
+            open.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "pdfaxe-output.pdf".into())
+        } else {
+            "pdfaxe-output.pdf".to_owned()
+        };
+        let mut dialog = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(suggested);
+        if open.on_disk {
+            if let Some(dir) = open.path.parent() {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        let Some(out) = dialog.save_file() else { return false };
+        self.write_document(out)
+    }
+
+    /// Save (Ctrl+S): overwrite the opened file in place, or fall back to
+    /// Save as… for documents that don't exist on disk yet.
+    fn save(&mut self) -> bool {
+        match &self.open {
+            Some(open) if open.on_disk => {
+                let path = open.path.clone();
+                self.write_document(path)
+            }
+            Some(_) => self.save_as(),
+            None => false,
+        }
+    }
+
+    /// Ask about unsaved work when the window is being closed.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        let Some(out) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name("pdfaxe-output.pdf")
-            .save_file()
-        else {
+        if self.allow_close || !self.open.as_ref().is_some_and(|o| o.edited) {
             return;
-        };
-        // Rebuild from the *current* (possibly text-edited) document state.
-        let result = Document::load_mem(&open.bytes)
-            .map_err(anyhow::Error::from)
-            .and_then(|fresh| {
-                let sels: Vec<PageSel> = open
-                    .rows
-                    .iter()
-                    .map(|r| PageSel { page: r.src_page, extra_rotation: r.rotation })
-                    .collect();
-                assemble(vec![(fresh, sels)])
-            });
-        match result {
-            Ok(mut doc) => match save(&mut doc, &out) {
-                Ok(()) => self.status = format!("Saved {} ({} pages)", out.display(), info(&doc).pages),
-                Err(e) => self.status = format!("Save failed: {e:#}"),
-            },
-            Err(e) => self.status = format!("Save failed: {e:#}"),
+        }
+        let name = self
+            .open
+            .as_ref()
+            .and_then(|o| o.path.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "this PDF".into());
+        let choice = rfd::MessageDialog::new()
+            .set_title("Unsaved changes")
+            .set_description(format!("Save changes to {name} before closing?"))
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match choice {
+            rfd::MessageDialogResult::Yes => {
+                if self.save() && !self.open.as_ref().is_some_and(|o| o.edited) {
+                    self.allow_close = true;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            rfd::MessageDialogResult::No => self.allow_close = true,
+            _ => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
         }
     }
 }
@@ -377,7 +555,14 @@ impl eframe::App for PdfaxeApp {
         }
         let pal = theme::palette(self.dark);
 
-        // Drag & drop anywhere: a PDF opens; images become a fresh PDF.
+        self.guard_close(&ctx);
+        if self.search_dirty {
+            self.search_dirty = false;
+            self.rerun_search();
+        }
+
+        // Drag & drop anywhere: a PDF opens (and wins over images dropped
+        // alongside it); images alone become a fresh PDF.
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
@@ -386,18 +571,31 @@ impl eframe::App for PdfaxeApp {
                     .map(|e| e.to_string_lossy().to_ascii_lowercase())
                     .is_some_and(|e| wanted.contains(&e.as_str()))
             };
+            let pdfs: Vec<PathBuf> = dropped.iter().filter(|p| ext_is(p, &["pdf"])).cloned().collect();
             let imgs: Vec<PathBuf> =
                 dropped.iter().filter(|p| ext_is(p, &["png", "jpg", "jpeg"])).cloned().collect();
-            if !imgs.is_empty() {
+            if let Some(first) = pdfs.first().cloned() {
+                self.open_path(first);
+                let ignored = pdfs.len() - 1 + imgs.len();
+                if ignored > 0 {
+                    self.status = format!(
+                        "{} — {ignored} other dropped file(s) ignored (one PDF at a time; drop images on their own to build a PDF)",
+                        self.status
+                    );
+                }
+            } else if !imgs.is_empty() {
                 self.open_images(&imgs);
-            } else if let Some(path) = dropped.into_iter().find(|p| ext_is(p, &["pdf"])) {
-                self.open_path(path);
+            } else {
+                self.status = "Dropped files weren't PDFs or PNG/JPEG images.".into();
             }
         }
 
-        // Ctrl+F focuses the search box.
+        // Ctrl+F focuses the search box; Ctrl+S saves.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
             ctx.memory_mut(|m| m.request_focus(search_box_id()));
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            self.save();
         }
 
         // Keyboard page navigation (when no text box has focus).
@@ -445,6 +643,13 @@ impl eframe::App for PdfaxeApp {
                     self.open_dialog();
                 }
                 let can_save = self.open.as_ref().is_some_and(|o| !o.rows.is_empty());
+                let save_tip = match &self.open {
+                    Some(o) if o.on_disk => format!("Save over {} (Ctrl+S)", o.path.display()),
+                    _ => "Save (Ctrl+S)".to_owned(),
+                };
+                if ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text(save_tip).clicked() {
+                    self.save();
+                }
                 if ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked() {
                     self.save_as();
                 }
@@ -468,6 +673,24 @@ impl eframe::App for PdfaxeApp {
                     }
                     if ui.button("Page numbers…").clicked() {
                         self.pn_open = true;
+                    }
+                    if ui
+                        .button("Strip metadata")
+                        .on_hover_text("Remove the Info dictionary (title, author, producer…), XMP and app-private data")
+                        .clicked()
+                    {
+                        if let Some(open) = self.open.as_mut() {
+                            let rep = strip_metadata(&mut open.doc);
+                            if rep.is_empty() {
+                                self.status = "No document metadata to strip.".into();
+                            } else {
+                                open.edited = true;
+                                self.status = match open.refresh_bytes() {
+                                    Ok(()) => format!("Stripped {}", describe_strip(&rep)),
+                                    Err(e) => format!("Stripped {} — {e}", describe_strip(&rep)),
+                                };
+                            }
+                        }
                     }
                     ui.separator();
                     let cur = match self.zoom {
@@ -610,11 +833,15 @@ impl eframe::App for PdfaxeApp {
                 });
                 match stamped {
                     Ok(n) => {
-                        open.refresh_bytes();
+                        let refreshed = open.refresh_bytes();
                         open.invalidate_all();
                         open.edited = true;
+                        self.search_dirty = true;
                         self.wm_open = false;
-                        self.status = format!("Watermarked {n} page(s)");
+                        self.status = match refreshed {
+                            Ok(()) => format!("Watermarked {n} page(s)"),
+                            Err(e) => format!("Watermarked {n} page(s) — {e}"),
+                        };
                     }
                     Err(e) => self.status = format!("Watermark failed: {e:#}"),
                 }
@@ -649,11 +876,15 @@ impl eframe::App for PdfaxeApp {
                 let opts = StampOpts { size: self.pn_size, gray: self.pn_gray, ..Default::default() };
                 match page_numbers(&mut open.doc, &self.pn_template, &opts) {
                     Ok(n) => {
-                        open.refresh_bytes();
+                        let refreshed = open.refresh_bytes();
                         open.invalidate_all();
                         open.edited = true;
+                        self.search_dirty = true;
                         self.pn_open = false;
-                        self.status = format!("Numbered {n} pages (bottom center)");
+                        self.status = match refreshed {
+                            Ok(()) => format!("Numbered {n} pages (bottom center)"),
+                            Err(e) => format!("Numbered {n} pages — {e}"),
+                        };
                     }
                     Err(e) => self.status = format!("Page numbers failed: {e:#}"),
                 }
@@ -775,7 +1006,7 @@ impl eframe::App for PdfaxeApp {
                                 if ui.small_button("R").on_hover_text("Rotate 90° (applied on save)").clicked() {
                                     rotate = Some(i);
                                 }
-                                if ui.small_button("X").on_hover_text("Delete").clicked() {
+                                if ui.small_button("X").on_hover_text("Delete (applied on save)").clicked() {
                                     delete = Some(i);
                                 }
                             });
@@ -799,25 +1030,36 @@ impl eframe::App for PdfaxeApp {
             if i > 0 {
                 open.rows.swap(i, i - 1);
                 open.selected = i - 1;
+                open.edited = true;
             }
         }
         if let Some(i) = move_down {
             if i + 1 < open.rows.len() {
                 open.rows.swap(i, i + 1);
                 open.selected = i + 1;
+                open.edited = true;
             }
         }
         if let Some(i) = rotate {
             open.rows[i].rotation = (open.rows[i].rotation + 90) % 360;
+            open.edited = true;
         }
         if let Some(i) = delete {
             open.rows.remove(i);
             if open.selected >= open.rows.len() && open.selected > 0 {
                 open.selected = open.rows.len() - 1;
             }
+            open.edited = true;
         }
 
         let Some(current_row) = open.rows.get(open.selected) else {
+            egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(120.0);
+                    ui.label(egui::RichText::new("Every page is deleted.").color(pal.text_weak));
+                    ui.label(egui::RichText::new("Re-open the file to start over.").color(pal.text_weak).small());
+                });
+            });
             return;
         };
         let page = current_row.src_page;
@@ -855,8 +1097,8 @@ impl eframe::App for PdfaxeApp {
                     egui::ScrollArea::vertical().max_height(ui.available_height() * 0.55).show(ui, |ui| {
                         for (i, run) in runs.iter().enumerate() {
                             let mut label = run.text.clone();
-                            if label.len() > 42 {
-                                label.truncate(42);
+                            if label.chars().count() > 42 {
+                                label = label.chars().take(42).collect();
                                 label.push('…');
                             }
                             if label.trim().is_empty() {
@@ -878,15 +1120,17 @@ impl eframe::App for PdfaxeApp {
                     ui.separator();
                     if let Some(ri) = open.selected_run {
                         if let Some(run) = runs.get(ri) {
+                            let why = if run.editable {
+                                ""
+                            } else if run.in_form {
+                                "· read-only (drawn through a form XObject)"
+                            } else {
+                                "· read-only (complex font)"
+                            };
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {:.0}pt {}",
-                                    run.font_res,
-                                    run.font_size,
-                                    if run.editable { "" } else { "· read-only (complex font)" }
-                                ))
-                                .color(pal.text_weak)
-                                .small(),
+                                egui::RichText::new(format!("{} · {:.0}pt {why}", run.font_res, run.display_size))
+                                    .color(pal.text_weak)
+                                    .small(),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut open.edit_buffer)
@@ -912,13 +1156,15 @@ impl eframe::App for PdfaxeApp {
             if let Some(run) = apply_edit {
                 match edit_run(&mut open.doc, page, &run, &open.edit_buffer) {
                     Ok(outcome) => {
-                        open.refresh_bytes();
+                        let refreshed = open.refresh_bytes();
                         open.invalidate_page(page);
                         open.selected_run = None;
                         open.edited = true;
-                        self.status = match outcome.refont {
-                            Some(font) => format!("Edited — new characters set in embedded {font}…"),
-                            None => "Edited — rendering the result…".into(),
+                        self.search_dirty = true;
+                        self.status = match (outcome.refont, refreshed) {
+                            (Some(font), Ok(())) => format!("Edited — new characters set in embedded {font}…"),
+                            (None, Ok(())) => "Edited — rendering the result…".into(),
+                            (_, Err(e)) => format!("Edited — {e}"),
                         };
                     }
                     Err(e) => self.status = format!("Edit failed: {e:#}"),
@@ -931,7 +1177,7 @@ impl eframe::App for PdfaxeApp {
         if self.redact_mode {
             egui::Panel::right("redact")
                 .resizable(true)
-                .default_size(260.0)
+                .default_size(280.0)
                 .frame(card_frame)
                 .show(ui, |ui| {
                     ui.add_space(2.0);
@@ -940,11 +1186,27 @@ impl eframe::App for PdfaxeApp {
                         egui::RichText::new(
                             "Drag boxes over content on the page. Burning re-renders those pages \
                              as bitmaps — the covered content is destroyed, not hidden (and the \
-                             page's text stops being selectable).",
+                             page's text stops being selectable). Annotations, form fields and \
+                             the thumbnail of a burned page go with it.",
                         )
                         .color(pal.text_weak)
                         .small(),
                     );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Burn resolution");
+                        egui::ComboBox::from_id_salt("redact_dpi")
+                            .selected_text(format!("{} dpi", self.redact_dpi as u32))
+                            .show_ui(ui, |ui| {
+                                for d in [150.0f32, 200.0, 300.0] {
+                                    ui.selectable_value(&mut self.redact_dpi, d, format!("{} dpi", d as u32));
+                                }
+                            });
+                    });
+                    ui.checkbox(&mut self.redact_strip_metadata, "Also strip document metadata")
+                        .on_hover_text("Info dictionary (title, author, producer…), XMP and app-private data");
+                    ui.checkbox(&mut self.redact_prune_bookmarks, "Also remove bookmarks to burned pages")
+                        .on_hover_text("Bookmark titles tend to say what a page was about");
                     ui.add_space(6.0);
                     let mut remove: Option<usize> = None;
                     for (i, (p, r)) in open.redact_boxes.iter().enumerate() {
@@ -963,7 +1225,7 @@ impl eframe::App for PdfaxeApp {
                     } else {
                         ui.add_space(8.0);
                         let label = format!("Burn {} box(es)", open.redact_boxes.len());
-                        burn_clicked = ui.add(theme::primary_button(&label)).clicked();
+                        burn_clicked = ui.add(theme::danger_button(&label)).clicked();
                         if ui.button("Clear all").clicked() {
                             open.redact_boxes.clear();
                         }
@@ -975,22 +1237,41 @@ impl eframe::App for PdfaxeApp {
             for (p, r) in open.redact_boxes.drain(..) {
                 by_page.entry(p).or_default().push(r);
             }
-            let mut result = Ok(());
-            for (p, rects) in &by_page {
-                if let Err(e) = redact_page(&mut open.doc, *p, rects, 200.0) {
-                    result = Err(e);
-                    break;
-                }
-            }
-            match result {
-                Ok(()) => {
-                    open.refresh_bytes();
+            let mut jobs: Vec<(u32, Vec<RedactRect>)> = by_page.into_iter().collect();
+            jobs.sort_by_key(|(p, _)| *p);
+            let opts = RedactOpts {
+                dpi: self.redact_dpi,
+                strip_metadata: self.redact_strip_metadata,
+                prune_bookmarks: self.redact_prune_bookmarks,
+            };
+            match redact_pages(&mut open.doc, &jobs, &opts) {
+                Ok(report) => {
+                    let refreshed = open.refresh_bytes();
                     open.invalidate_all();
+                    open.recompute_geometry();
                     open.edited = true;
-                    self.status = format!(
-                        "Burned boxes on {} page(s) — those pages are bitmaps now",
-                        by_page.len()
+                    self.search_dirty = true;
+                    let mut msg = format!(
+                        "Burned {} box(es) on {} page(s) — those pages are bitmaps now",
+                        report.boxes,
+                        report.pages.len()
                     );
+                    if report.fields_detached > 0 {
+                        msg.push_str(&format!(" · {} form field(s) detached", report.fields_detached));
+                    }
+                    if report.bookmarks_removed > 0 {
+                        msg.push_str(&format!(" · {} bookmark(s) removed", report.bookmarks_removed));
+                    }
+                    if !report.metadata.is_empty() {
+                        msg.push_str(&format!(" · stripped {}", describe_strip(&report.metadata)));
+                    }
+                    if report.structure_dropped {
+                        msg.push_str(" · tag tree dropped");
+                    }
+                    if let Err(e) = refreshed {
+                        msg.push_str(&format!(" · {e}"));
+                    }
+                    self.status = msg;
                 }
                 Err(e) => self.status = format!("Redact failed: {e:#}"),
             }
@@ -1003,10 +1284,16 @@ impl eframe::App for PdfaxeApp {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let state = if !open.on_disk {
+                " (not saved yet)"
+            } else if open.edited {
+                " (edited)"
+            } else {
+                ""
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "{file_name}{} · PDF {} · {} pages · page {page}",
-                    if open.edited { " (edited)" } else { "" },
+                    "{file_name}{state} · PDF {} · {} pages · page {page}",
                     info(&open.doc).version,
                     open.rows.len(),
                 ))
@@ -1050,6 +1337,7 @@ impl eframe::App for PdfaxeApp {
                     for i in 0..open.rows.len() {
                         let pg = open.rows[i].src_page;
                         let (pw, ph) = open.page_points.get(&pg).copied().unwrap_or((595.0, 842.0));
+                        let view = open.view(pg);
                         let display_w = match self.zoom {
                             Zoom::FitWidth => avail,
                             Zoom::Scale(z) => pw * z,
@@ -1127,12 +1415,32 @@ impl eframe::App for PdfaxeApp {
                             );
                         }
 
-                        // Click text on any page to select it for editing.
+                        // Screen ↔ display space (points from the displayed
+                        // page's bottom-left). Text runs live in user space;
+                        // `view` converts between the two.
                         let s = rect.width() / pw.max(1.0);
+                        let to_display =
+                            |pos: egui::Pos2| ((pos.x - rect.min.x) / s, ph - (pos.y - rect.min.y) / s);
+                        let display_rect_to_screen = |dx: f32, dy: f32, dw: f32, dh: f32| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x + dx * s, rect.min.y + (ph - dy - dh) * s),
+                                egui::vec2(dw * s, dh * s),
+                            )
+                        };
+                        let run_box = |run: &TextRun| -> (f32, f32, f32, f32) {
+                            let ds = run.display_size.max(1.0);
+                            let width_est = run
+                                .width
+                                .unwrap_or_else(|| run.text.chars().count() as f32 * ds * 0.55)
+                                .max(12.0);
+                            (run.x, run.y - ds * 0.25, width_est, ds * 1.3)
+                        };
+
+                        // Click text on any page to select it for editing.
                         if self.edit_mode {
                             if let (true, Some(pos)) = (response.clicked(), response.interact_pointer_pos()) {
-                                let px = (pos.x - rect.min.x) / s;
-                                let py = ph - (pos.y - rect.min.y) / s;
+                                let (dx, dy) = to_display(pos);
+                                let (ux, uy) = view.from_display(dx, dy);
                                 if !open.runs_cache.contains_key(&pg) {
                                     let runs = text_runs(&open.doc, pg).unwrap_or_default();
                                     open.runs_cache.insert(pg, runs);
@@ -1140,14 +1448,13 @@ impl eframe::App for PdfaxeApp {
                                 if let Some(runs) = open.runs_cache.get(&pg) {
                                     let mut best: Option<(usize, f32)> = None;
                                     for (ri, run) in runs.iter().enumerate() {
-                                        let width_est = run
-                                            .width
-                                            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55);
-                                        let within_x = px >= run.x - 4.0 && px <= run.x + width_est + 8.0;
-                                        let dy = (py - run.y - run.font_size * 0.3).abs();
-                                        if within_x && dy < run.font_size * 1.2 {
-                                            if best.is_none_or(|(_, d)| dy < d) {
-                                                best = Some((ri, dy));
+                                        let (bx, by, bw, bh) = run_box(run);
+                                        let within_x = ux >= bx - 4.0 && ux <= bx + bw + 8.0;
+                                        let cy = by + bh * 0.5;
+                                        let dyy = (uy - cy).abs();
+                                        if within_x && dyy < bh {
+                                            if best.is_none_or(|(_, d)| dyy < d) {
+                                                best = Some((ri, dyy));
                                             }
                                         }
                                     }
@@ -1162,79 +1469,68 @@ impl eframe::App for PdfaxeApp {
 
                         // Highlight the selected run (text edit or search jump).
                         if i == open.selected {
-                                if let Some(ri) = open.selected_run {
-                                    if let Some(run) = open.runs_cache.get(&pg).and_then(|r| r.get(ri)) {
-                                        let width_est = run
-                                            .width
-                                            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.55)
-                                            .max(12.0);
-                                        let h = run.font_size * 1.3;
-                                        let min = egui::pos2(
-                                            rect.min.x + run.x * s,
-                                            rect.min.y + (ph - run.y - run.font_size) * s,
-                                        );
-                                        let hi_rect = egui::Rect::from_min_size(
-                                            min,
-                                            egui::vec2(width_est * s, h * s),
-                                        );
-                                        ui.painter().rect_stroke(
-                                            hi_rect,
-                                            2.0,
-                                            egui::Stroke::new(2.0, theme::AXE_ORANGE_BRIGHT),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                    }
+                            if let Some(ri) = open.selected_run {
+                                if let Some(run) = open.runs_cache.get(&pg).and_then(|r| r.get(ri)) {
+                                    let (bx, by, bw, bh) = run_box(run);
+                                    let (dx, dy, dw, dh) = view.rect_to_display(bx, by, bw, bh);
+                                    let hi_rect = display_rect_to_screen(dx, dy, dw, dh);
+                                    ui.painter().rect_stroke(
+                                        hi_rect,
+                                        2.0,
+                                        egui::Stroke::new(2.0, theme::AXE_ORANGE_BRIGHT),
+                                        egui::StrokeKind::Outside,
+                                    );
                                 }
                             }
+                        }
 
                         // Drag boxes to redact; committed boxes preview in black.
                         if self.redact_mode {
-                            let to_page =
-                                |pos: egui::Pos2| ((pos.x - rect.min.x) / s, ph - (pos.y - rect.min.y) / s);
                             if response.drag_started() {
                                 if let Some(pos) = response.interact_pointer_pos() {
-                                    open.redact_drag = Some((pg, to_page(pos)));
+                                    let p = to_display(pos);
+                                    open.redact_drag = Some((pg, p, p));
                                 }
                             }
-                            if let Some((dpg, start)) = open.redact_drag {
+                            if let Some((dpg, start, cur_prev)) = open.redact_drag {
                                 if dpg == pg {
-                                    if let Some(pos) = response.interact_pointer_pos() {
-                                        let cur = to_page(pos);
-                                        let (x0, x1) = (start.0.min(cur.0), start.0.max(cur.0));
-                                        let (y0, y1) = (start.1.min(cur.1), start.1.max(cur.1));
-                                        let scr = egui::Rect::from_min_size(
-                                            egui::pos2(rect.min.x + x0 * s, rect.min.y + (ph - y1) * s),
-                                            egui::vec2((x1 - x0) * s, (y1 - y0) * s),
-                                        );
-                                        ui.painter().rect_filled(
-                                            scr,
-                                            0.0,
-                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
-                                        );
-                                        ui.painter().rect_stroke(
-                                            scr,
-                                            0.0,
-                                            egui::Stroke::new(1.5, egui::Color32::RED),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                        if response.drag_stopped() {
-                                            if x1 - x0 > 2.0 && y1 - y0 > 2.0 {
-                                                open.redact_boxes.push((
-                                                    pg,
-                                                    RedactRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
-                                                ));
-                                            }
-                                            open.redact_drag = None;
+                                    // Follow the pointer even when it leaves the
+                                    // page or the window; the last known point
+                                    // is what a release outside commits.
+                                    let cur = response
+                                        .interact_pointer_pos()
+                                        .or_else(|| ctx.pointer_latest_pos())
+                                        .map(to_display)
+                                        .unwrap_or(cur_prev);
+                                    open.redact_drag = Some((dpg, start, cur));
+                                    let (x0, x1) = (start.0.min(cur.0).max(0.0), start.0.max(cur.0).min(pw));
+                                    let (y0, y1) = (start.1.min(cur.1).max(0.0), start.1.max(cur.1).min(ph));
+                                    let scr = display_rect_to_screen(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0));
+                                    ui.painter().rect_filled(
+                                        scr,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        scr,
+                                        0.0,
+                                        egui::Stroke::new(1.5, egui::Color32::RED),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                    if response.drag_stopped() {
+                                        if x1 - x0 > 2.0 && y1 - y0 > 2.0 {
+                                            open.redact_boxes.push((
+                                                pg,
+                                                RedactRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+                                            ));
                                         }
+                                        open.redact_drag = None;
                                     }
                                 }
                             }
                             for (bp, r) in &open.redact_boxes {
                                 if *bp == pg {
-                                    let scr = egui::Rect::from_min_size(
-                                        egui::pos2(rect.min.x + r.x * s, rect.min.y + (ph - r.y - r.h) * s),
-                                        egui::vec2(r.w * s, r.h * s),
-                                    );
+                                    let scr = display_rect_to_screen(r.x, r.y, r.w, r.h);
                                     ui.painter().rect_filled(
                                         scr,
                                         0.0,
@@ -1252,6 +1548,18 @@ impl eframe::App for PdfaxeApp {
                     }
                 });
             });
+            // A drag that ended on a frame where its page wasn't laid out
+            // (scrolled away) must not linger forever.
+            if open.redact_drag.is_some() && ctx.input(|i| !i.pointer.any_down()) {
+                if let Some((dpg, start, cur)) = open.redact_drag.take() {
+                    let (pw, ph) = open.page_points.get(&dpg).copied().unwrap_or((595.0, 842.0));
+                    let (x0, x1) = (start.0.min(cur.0).max(0.0), start.0.max(cur.0).min(pw));
+                    let (y0, y1) = (start.1.min(cur.1).max(0.0), start.1.max(cur.1).min(ph));
+                    if x1 - x0 > 2.0 && y1 - y0 > 2.0 {
+                        open.redact_boxes.push((dpg, RedactRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }));
+                    }
+                }
+            }
 
             // Free textures far from the viewport so huge documents stay lean.
             open.textures.retain(|p, _| keep_textures.contains(p));

@@ -92,10 +92,16 @@ fn num(o: &Object) -> Option<f32> {
 
 /// Width tables for every measurable font in the page's resources.
 pub(crate) fn page_font_widths(doc: &Document, page_id: ObjectId) -> HashMap<String, GlyphWidths> {
-    let mut out = HashMap::new();
-    let Some(res_obj) = resolve_inherited(doc, page_id, b"Resources") else { return out };
+    let Some(res_obj) = resolve_inherited(doc, page_id, b"Resources") else { return HashMap::new() };
     let res_resolved = resolve(doc, &res_obj).clone();
-    let Ok(res_dict) = res_resolved.as_dict() else { return out };
+    let Ok(res_dict) = res_resolved.as_dict() else { return HashMap::new() };
+    widths_from_resources(doc, res_dict)
+}
+
+/// Width tables for every measurable font in a resources dictionary (a
+/// page's, or a form XObject's).
+pub(crate) fn widths_from_resources(doc: &Document, res_dict: &Dictionary) -> HashMap<String, GlyphWidths> {
+    let mut out = HashMap::new();
     let Some(fonts_obj) = res_dict.get(b"Font").ok().cloned() else { return out };
     let fonts_resolved = resolve(doc, &fonts_obj).clone();
     let Ok(fonts) = fonts_resolved.as_dict() else { return out };
@@ -115,6 +121,9 @@ fn widths_for_font(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
     let subtype = font.get(b"Subtype").ok().and_then(|o| o.as_name().ok()).unwrap_or_default();
     if subtype == b"Type0" {
         return cid_widths(doc, font);
+    }
+    if subtype == b"Type3" {
+        return type3_widths(doc, font);
     }
 
     let missing = font
@@ -140,6 +149,32 @@ fn widths_for_font(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
     // No /Widths: standard-14 built-ins by (aliased) base font name.
     let base = font.get(b"BaseFont").ok().and_then(|o| o.as_name().ok()).unwrap_or_default();
     std14_widths(base)
+}
+
+/// Type3 widths live in *glyph space*; /FontMatrix maps them to text space.
+/// Scaled into the usual thousandths so [`advance`] needs no special case.
+/// Skewed or rotated font matrices (rare, decorative) are not measured.
+fn type3_widths(doc: &Document, font: &Dictionary) -> Option<GlyphWidths> {
+    let fm: Vec<f32> = font
+        .get(b"FontMatrix")
+        .ok()
+        .map(|o| resolve(doc, o))
+        .and_then(|o| o.as_array().ok())
+        .map(|a| a.iter().filter_map(|x| num(resolve(doc, x))).collect())
+        .unwrap_or_default();
+    if fm.len() != 6 || fm[1].abs() > 1e-6 || fm[2].abs() > 1e-6 || fm[0].abs() < 1e-9 {
+        return None;
+    }
+    let to_thousandths = fm[0] * 1000.0;
+    let (Ok(fc), Ok(w_obj)) = (font.get(b"FirstChar"), font.get(b"Widths")) else { return None };
+    let first = resolve(doc, fc).as_i64().ok()?.clamp(0, 255) as usize;
+    let Object::Array(arr) = resolve(doc, w_obj) else { return None };
+    let mut by_code = Box::new([None; 256]);
+    for (i, item) in arr.iter().enumerate() {
+        let Some(code) = first.checked_add(i).filter(|&c| c < 256) else { break };
+        by_code[code] = num(resolve(doc, item)).map(|w| w * to_thousandths);
+    }
+    Some(GlyphWidths::Simple { by_code, missing: None })
 }
 
 /// CID-keyed widths of a Type0 font's descendant: /W runs plus the /DW
@@ -215,7 +250,15 @@ pub(crate) fn std14_widths(base_font: &[u8]) -> Option<GlyphWidths> {
         "Times-Bold" | "TimesNewRomanPS-BoldMT" => (&TIMES_BOLD, 500.0),
         "Times-Italic" | "TimesNewRomanPS-ItalicMT" => (&TIMES_ITALIC, 500.0),
         "Times-BoldItalic" | "TimesNewRomanPS-BoldItalicMT" => (&TIMES_BOLD_ITALIC, 500.0),
-        n if n.starts_with("Courier") => {
+        // Courier and its aliases: "Courier", "Courier-Bold", "CourierNew",
+        // "CourierNewPSMT", "Courier,Bold", "CourierStd" — but not any font
+        // that merely begins with the word.
+        n if n == "Courier"
+            || n.starts_with("Courier-")
+            || n.starts_with("Courier,")
+            || n.starts_with("CourierNew")
+            || n.starts_with("CourierStd") =>
+        {
             let mut by_code = Box::new([None; 256]);
             for c in 32..=126usize {
                 by_code[c] = Some(600.0);
@@ -312,7 +355,9 @@ mod tests {
         assert!(std14_widths(b"ArialMT").is_some());
         assert!(std14_widths(b"TimesNewRomanPSMT").is_some());
         assert!(std14_widths(b"CourierNewPSMT").is_some());
+        assert!(std14_widths(b"Courier-BoldOblique").is_some());
         assert!(std14_widths(b"SomeCustomFont").is_none());
+        assert!(std14_widths(b"CourierXyzDisplay").is_none(), "a font merely starting with Courier isn't Courier");
     }
 
     #[test]

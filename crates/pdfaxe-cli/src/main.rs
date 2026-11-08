@@ -2,10 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use pdfaxe_core::lopdf::Document;
 use pdfaxe_core::ops::all_pages;
 use pdfaxe_core::{
-    assemble, extract_text, images_to_pdf, info, load, page_numbers, parse_ranges, redact_page,
-    rotate_pages, save, watermark, PageSel, RedactRect, StampOpts,
+    assemble, extract_text, images_to_pdf, info, load, page_numbers, parse_ranges, redact_pages,
+    rotate_pages, save, strip_metadata, watermark, PageSel, RedactOpts, RedactRect, StampOpts, StripReport,
 };
 
 #[derive(Parser)]
@@ -19,7 +20,7 @@ struct Cli {
 enum Command {
     /// Show page count, PDF version and encryption status
     Info { file: PathBuf },
-    /// Merge PDFs into one, in argument order
+    /// Merge PDFs into one, in argument order (forms, bookmarks and attachments ride along)
     Merge {
         /// Output file
         #[arg(short, long)]
@@ -121,19 +122,39 @@ enum Command {
         #[arg(long, default_value_t = 10.0)]
         size: f32,
     },
-    /// Redact by raster burn — the covered content is destroyed, not hidden
-    /// (the whole page becomes a bitmap; its text stops being selectable)
+    /// Redact by raster burn — the covered content is destroyed, not hidden.
+    /// The whole page becomes a bitmap; its text stops being selectable, the
+    /// page's annotations, form fields and thumbnail go with it, and the
+    /// original content is gone from the file — not just from the page tree.
     Redact {
         input: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
-        #[arg(short, long)]
-        page: u32,
-        /// Box to burn, "x,y,w,h" in points, origin bottom-left (repeatable)
+        /// Page to redact (1-based)
+        #[arg(short, long, conflicts_with = "pages")]
+        page: Option<u32>,
+        /// Several pages, e.g. "1-3,7" — the same boxes are burned on each
+        #[arg(long)]
+        pages: Option<String>,
+        /// Box to burn, "x,y,w,h" in points from the bottom-left of the page as
+        /// displayed (repeatable)
         #[arg(long = "rect", value_name = "X,Y,W,H", required = true)]
         rects: Vec<String>,
         #[arg(long, default_value_t = 200.0)]
         dpi: f32,
+        /// Keep the document's Info dictionary and XMP metadata (stripped by default)
+        #[arg(long)]
+        keep_metadata: bool,
+        /// Keep bookmarks that point at redacted pages (removed by default)
+        #[arg(long)]
+        keep_bookmarks: bool,
+    },
+    /// Strip document metadata: Info dictionary (title, author, producer…),
+    /// XMP, and application private data
+    Scrub {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
     },
 }
 
@@ -142,6 +163,23 @@ fn parse_rect(s: &str) -> Result<RedactRect> {
     anyhow::ensure!(parts.len() == 4, "--rect wants exactly x,y,w,h (got {s:?})");
     anyhow::ensure!(parts[2] > 0.0 && parts[3] > 0.0, "--rect width/height must be positive");
     Ok(RedactRect { x: parts[0], y: parts[1], w: parts[2], h: parts[3] })
+}
+
+fn describe_strip(rep: &StripReport) -> String {
+    let mut parts = Vec::new();
+    if rep.info {
+        parts.push("Info dictionary".to_owned());
+    }
+    if rep.xmp {
+        parts.push("XMP metadata".to_owned());
+    }
+    if rep.piece_info > 0 {
+        parts.push(format!("{} PieceInfo dict(s)", rep.piece_info));
+    }
+    if rep.page_metadata > 0 {
+        parts.push(format!("{} page metadata stream(s)", rep.page_metadata));
+    }
+    if parts.is_empty() { "nothing to strip".to_owned() } else { parts.join(", ") }
 }
 
 fn main() -> Result<()> {
@@ -194,6 +232,7 @@ fn main() -> Result<()> {
             println!("{}", extract_text(&doc, page)?);
         }
         Command::Render { input, out, page, pages, width } => {
+            // One read serves both the renderer and the page count.
             let bytes = std::fs::read(&input)?;
             match pages {
                 None => {
@@ -202,7 +241,7 @@ fn main() -> Result<()> {
                     println!("rendered page {page} at {width}px -> {}", out.display());
                 }
                 Some(expr) => {
-                    let count = info(&load(&input)?).pages;
+                    let count = info(&Document::load_mem(&bytes)?).pages;
                     let selected = parse_ranges(&expr, count)?;
                     let stem = out.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".into());
                     let dir = out.parent().map(PathBuf::from).unwrap_or_default();
@@ -225,14 +264,16 @@ fn main() -> Result<()> {
         Command::Runs { input, page } => {
             let doc = load(&input)?;
             for (i, run) in pdfaxe_core::text::text_runs(&doc, page)?.iter().enumerate() {
+                let state = if run.editable {
+                    "editable"
+                } else if run.in_form {
+                    "read-only (form XObject)"
+                } else {
+                    "read-only"
+                };
                 println!(
                     "[{i:3}] {} {:>5.1}pt @({:.0},{:.0}) {} {:?}",
-                    run.font_res,
-                    run.font_size,
-                    run.x,
-                    run.y,
-                    if run.editable { "editable" } else { "read-only" },
-                    run.text,
+                    run.font_res, run.display_size, run.x, run.y, state, run.text,
                 );
             }
         }
@@ -268,16 +309,44 @@ fn main() -> Result<()> {
             save(&mut doc, &out)?;
             println!("numbered {total} pages -> {}", out.display());
         }
-        Command::Redact { input, out, page, rects, dpi } => {
+        Command::Redact { input, out, page, pages, rects, dpi, keep_metadata, keep_bookmarks } => {
             let boxes: Vec<RedactRect> = rects.iter().map(|s| parse_rect(s)).collect::<Result<_>>()?;
             let mut doc = load(&input)?;
-            redact_page(&mut doc, page, &boxes, dpi)?;
+            let count = info(&doc).pages;
+            let targets: Vec<u32> = match (page, pages) {
+                (Some(p), _) => vec![p],
+                (None, Some(expr)) => parse_ranges(&expr, count)?,
+                (None, None) => anyhow::bail!("say which page to redact: --page N or --pages \"1-3\""),
+            };
+            let jobs: Vec<(u32, Vec<RedactRect>)> = targets.iter().map(|&p| (p, boxes.clone())).collect();
+            let opts = RedactOpts { dpi, strip_metadata: !keep_metadata, prune_bookmarks: !keep_bookmarks };
+            let report = redact_pages(&mut doc, &jobs, &opts)?;
             save(&mut doc, &out)?;
+            let pages_txt: Vec<String> = report.pages.iter().map(|p| p.to_string()).collect();
             println!(
-                "burned {} box(es) out of page {page} -> {} (page is now a bitmap)",
-                boxes.len(),
+                "burned {} box(es) on page(s) {} -> {} (those pages are bitmaps now)",
+                report.boxes,
+                pages_txt.join(","),
                 out.display()
             );
+            if report.fields_detached > 0 {
+                println!("  detached {} form field node(s) whose widgets were on the burned page(s)", report.fields_detached);
+            }
+            if report.structure_dropped {
+                println!("  dropped the tagged-PDF structure tree (it can carry text alternates)");
+            }
+            if opts.prune_bookmarks {
+                println!("  removed {} bookmark(s) pointing at the burned page(s)", report.bookmarks_removed);
+            }
+            if opts.strip_metadata {
+                println!("  metadata: {}", describe_strip(&report.metadata));
+            }
+        }
+        Command::Scrub { input, out } => {
+            let mut doc = load(&input)?;
+            let rep = strip_metadata(&mut doc);
+            save(&mut doc, &out)?;
+            println!("stripped {} -> {}", describe_strip(&rep), out.display());
         }
     }
     Ok(())

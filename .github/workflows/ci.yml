@@ -32,6 +32,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --release
 
+      # RustSec advisories against Cargo.lock. Accepted exceptions live in
+      # .cargo/audit.toml with a reason next to each one.
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache WiX 3.14.1
         id: wix-cache
         uses: actions/cache@v4

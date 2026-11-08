@@ -23,26 +23,36 @@ use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::fonts::{embed_replacement, FontHints};
-use crate::metrics::{advance, page_font_widths, tj_number_advance, AdvanceState, GlyphWidths};
+use crate::metrics::{
+    advance, page_font_widths, tj_number_advance, widths_from_resources, AdvanceState, GlyphWidths,
+};
 use crate::ops::resolve_inherited;
 
 /// One show-text operation (or one string element inside a TJ array).
 #[derive(Debug, Clone)]
 pub struct TextRun {
-    /// Index of the operation in the page's decoded content stream.
+    /// Index of the operation in the decoded content stream (the page's, or
+    /// the form XObject's when `in_form`).
     pub op_index: usize,
     /// For TJ: index of the string element inside the operand array.
     pub tj_item: Option<usize>,
     /// Font resource name (e.g. "F0").
     pub font_res: String,
+    /// Nominal size from `Tf` — what a replacement `Tf` must repeat.
     pub font_size: f32,
-    /// Text-space origin (baseline) at the start of the run, PDF points.
+    /// Size as rendered: `font_size` × text-matrix scale × CTM scale.
+    pub display_size: f32,
+    /// Baseline origin at the start of the run in PDF user space (text
+    /// matrix and CTM applied) — directly comparable with page geometry.
     pub x: f32,
     pub y: f32,
-    /// Advance width in text-space points, when the font is measurable.
+    /// Advance width in user-space points, when the font is measurable.
     pub width: Option<f32>,
     pub text: String,
     pub editable: bool,
+    /// Drawn through a form XObject (`Do`). Listed for search and display,
+    /// but not editable in place.
+    pub in_form: bool,
 }
 
 /// Byte-level decoder/encoder for one font resource.
@@ -305,40 +315,138 @@ fn table_codec(table: &EncTable, invertible: bool) -> FontCodec {
     FontCodec { to_uni, from_uni, code_len: 1, invertible }
 }
 
-/// Parse hex tokens like <0041> from a CMap byte stream, starting at `pos`.
-fn next_hex(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
-    while *pos < data.len() && data[*pos] != b'<' {
-        // stop scanning at section keywords
-        if data[*pos] == b'e'
-            && (data[*pos..].starts_with(b"endbfchar") || data[*pos..].starts_with(b"endbfrange"))
-        {
-            return None;
-        }
-        *pos += 1;
-    }
-    if *pos >= data.len() {
+/// Lexical pieces of a CMap that matter for ToUnicode parsing.
+enum CTok<'a> {
+    Hex(Vec<u8>),
+    Open,
+    Close,
+    Kw(&'a [u8]),
+    Other,
+}
+
+fn is_delim_or_ws(c: u8) -> bool {
+    matches!(
+        c,
+        b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0' | b'<' | b'>' | b'[' | b']' | b'(' | b')' | b'/' | b'%' | b'{' | b'}'
+    )
+}
+
+/// `<hex digits>` → bytes; an odd trailing digit is padded with 0 as the
+/// PDF spec prescribes.
+fn hex_bytes(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.is_empty() {
         return None;
     }
-    *pos += 1; // skip '<'
-    let start = *pos;
-    while *pos < data.len() && data[*pos] != b'>' {
-        *pos += 1;
+    let mut h = hex.to_vec();
+    if h.len() % 2 == 1 {
+        h.push(b'0');
     }
-    let hex: Vec<u8> = data[start..*pos]
-        .iter()
-        .copied()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
-    *pos += 1; // skip '>'
-    if hex.is_empty() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks(2) {
+    let mut bytes = Vec::with_capacity(h.len() / 2);
+    for pair in h.chunks(2) {
         let s = std::str::from_utf8(pair).ok()?;
         bytes.push(u8::from_str_radix(s, 16).ok()?);
     }
     Some(bytes)
+}
+
+/// Tokenize a CMap stream: hex strings, array brackets, bare keywords.
+/// Dictionaries, literal strings, names and numbers are skipped as a unit so
+/// a `<< … >>` in `/CIDSystemInfo` never reads as a hex string.
+fn cmap_tokens(data: &[u8]) -> Vec<CTok<'_>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        match data[i] {
+            b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0' => i += 1,
+            b'%' => {
+                while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'<' => {
+                if data.get(i + 1) == Some(&b'<') {
+                    let mut depth = 0i32;
+                    while i < data.len() {
+                        if data[i..].starts_with(b"<<") {
+                            depth += 1;
+                            i += 2;
+                        } else if data[i..].starts_with(b">>") {
+                            depth -= 1;
+                            i += 2;
+                            if depth <= 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.push(CTok::Other);
+                } else {
+                    i += 1;
+                    let start = i;
+                    while i < data.len() && data[i] != b'>' {
+                        i += 1;
+                    }
+                    let hex: Vec<u8> = data[start..i].iter().copied().filter(|c| c.is_ascii_hexdigit()).collect();
+                    i += 1; // '>'
+                    match hex_bytes(&hex) {
+                        Some(b) => out.push(CTok::Hex(b)),
+                        None => out.push(CTok::Other),
+                    }
+                }
+            }
+            b'[' => {
+                out.push(CTok::Open);
+                i += 1;
+            }
+            b']' => {
+                out.push(CTok::Close);
+                i += 1;
+            }
+            b'(' => {
+                let mut depth = 0i32;
+                while i < data.len() {
+                    match data[i] {
+                        b'\\' => i += 2,
+                        b'(' => {
+                            depth += 1;
+                            i += 1;
+                        }
+                        b')' => {
+                            depth -= 1;
+                            i += 1;
+                            if depth <= 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+                out.push(CTok::Other);
+            }
+            b'/' => {
+                i += 1;
+                while i < data.len() && !is_delim_or_ws(data[i]) {
+                    i += 1;
+                }
+                out.push(CTok::Other);
+            }
+            b'{' | b'}' | b'>' | b')' => i += 1,
+            _ => {
+                let start = i;
+                while i < data.len() && !is_delim_or_ws(data[i]) {
+                    i += 1;
+                }
+                let tok = &data[start..i];
+                if tok.first().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    out.push(CTok::Kw(tok));
+                } else {
+                    out.push(CTok::Other);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
@@ -350,54 +458,98 @@ fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
-/// Parse a ToUnicode CMap's bfchar/bfrange sections into a codec.
+/// The destination of a bfrange with a single `<dst>`: the last scalar is
+/// incremented by the code's offset from the range start.
+fn bump_last(dst: &[u8], offset: usize) -> Option<String> {
+    let mut s = utf16be_to_string(dst)?;
+    let last = s.pop()?;
+    let bumped = char::from_u32(last as u32 + offset as u32)?;
+    s.push(bumped);
+    Some(s)
+}
+
+/// Parse a ToUnicode CMap's codespacerange/bfchar/bfrange sections into a
+/// codec. Both bfrange forms are handled: `<lo> <hi> <dst>` and
+/// `<lo> <hi> [<d1> <d2> …]`.
 fn tounicode_codec(cmap: &[u8]) -> Option<FontCodec> {
+    let toks = cmap_tokens(cmap);
     let mut to_uni: HashMap<Vec<u8>, String> = HashMap::new();
-    let mut code_len = 1usize;
+    let mut code_len = 0usize;
 
-    let mut pos = 0usize;
-    while let Some(found) = find_from(cmap, pos, b"beginbfchar") {
-        pos = found + b"beginbfchar".len();
-        loop {
-            let Some(src) = next_hex(cmap, &mut pos) else { break };
-            let Some(dst) = next_hex(cmap, &mut pos) else { break };
-            code_len = code_len.max(src.len());
-            if let Some(s) = utf16be_to_string(&dst) {
-                to_uni.insert(src, s);
+    let mut i = 0usize;
+    while i < toks.len() {
+        match &toks[i] {
+            CTok::Kw(k) if *k == b"begincodespacerange" => {
+                i += 1;
+                while let (Some(CTok::Hex(lo)), Some(CTok::Hex(_))) = (toks.get(i), toks.get(i + 1)) {
+                    code_len = code_len.max(lo.len());
+                    i += 2;
+                }
             }
-        }
-    }
-
-    pos = 0;
-    while let Some(found) = find_from(cmap, pos, b"beginbfrange") {
-        pos = found + b"beginbfrange".len();
-        loop {
-            let Some(lo) = next_hex(cmap, &mut pos) else { break };
-            let Some(hi) = next_hex(cmap, &mut pos) else { break };
-            let Some(dst) = next_hex(cmap, &mut pos) else { break };
-            code_len = code_len.max(lo.len());
-            let (lo_n, hi_n) = (be_num(&lo), be_num(&hi));
-            let width = lo.len();
-            if hi_n < lo_n || hi_n - lo_n > 65_535 {
-                break;
-            }
-            for (offset, code) in (lo_n..=hi_n).enumerate() {
-                let src = num_be(code, width);
-                if let Some(mut s) = utf16be_to_string(&dst) {
-                    // increment the last scalar by offset
-                    if let Some(last) = s.pop() {
-                        if let Some(bumped) = char::from_u32(last as u32 + offset as u32) {
-                            s.push(bumped);
-                            to_uni.insert(src, s);
+            CTok::Kw(k) if *k == b"beginbfchar" => {
+                i += 1;
+                loop {
+                    match (toks.get(i), toks.get(i + 1)) {
+                        (Some(CTok::Hex(src)), Some(CTok::Hex(dst))) => {
+                            if let Some(s) = utf16be_to_string(dst) {
+                                to_uni.insert(src.clone(), s);
+                            }
+                            i += 2;
                         }
+                        // `<src> /glyphname` form: not a Unicode mapping, skip.
+                        (Some(CTok::Hex(_)), Some(CTok::Other)) => i += 2,
+                        _ => break,
                     }
                 }
             }
+            CTok::Kw(k) if *k == b"beginbfrange" => {
+                i += 1;
+                loop {
+                    let (Some(CTok::Hex(lo)), Some(CTok::Hex(hi))) = (toks.get(i), toks.get(i + 1)) else { break };
+                    let (lo_n, hi_n) = (be_num(lo), be_num(hi));
+                    let width = lo.len();
+                    if hi_n < lo_n || hi_n - lo_n > 65_535 {
+                        break;
+                    }
+                    match toks.get(i + 2) {
+                        Some(CTok::Hex(dst)) => {
+                            for (offset, code) in (lo_n..=hi_n).enumerate() {
+                                if let Some(s) = bump_last(dst, offset) {
+                                    to_uni.insert(num_be(code, width), s);
+                                }
+                            }
+                            i += 3;
+                        }
+                        Some(CTok::Open) => {
+                            let mut j = i + 3;
+                            let mut code = lo_n;
+                            while let Some(CTok::Hex(dst)) = toks.get(j) {
+                                if code <= hi_n {
+                                    if let Some(s) = utf16be_to_string(dst) {
+                                        to_uni.insert(num_be(code, width), s);
+                                    }
+                                }
+                                code += 1;
+                                j += 1;
+                            }
+                            if matches!(toks.get(j), Some(CTok::Close)) {
+                                j += 1;
+                            }
+                            i = j;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            _ => i += 1,
         }
     }
 
     if to_uni.is_empty() {
         return None;
+    }
+    if code_len == 0 {
+        code_len = to_uni.keys().map(|k| k.len()).max().unwrap_or(1);
     }
     // uniform code length is assumed; mixed-width CMaps are rare in practice
     let uniform = to_uni.keys().all(|k| k.len() == code_len);
@@ -419,10 +571,6 @@ fn tounicode_codec(cmap: &[u8]) -> Option<FontCodec> {
     Some(FontCodec { to_uni, from_uni, code_len, invertible })
 }
 
-fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
-}
-
 fn be_num(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32)
 }
@@ -440,10 +588,16 @@ fn resolve<'a>(doc: &'a Document, obj: &'a Object) -> &'a Object {
 
 /// Build codecs for every font in the page's resources.
 fn page_font_codecs(doc: &Document, page_id: ObjectId) -> HashMap<String, FontCodec> {
-    let mut out = HashMap::new();
-    let Some(res_obj) = resolve_inherited(doc, page_id, b"Resources") else { return out };
+    let Some(res_obj) = resolve_inherited(doc, page_id, b"Resources") else { return HashMap::new() };
     let res_resolved = resolve(doc, &res_obj).clone();
-    let Ok(res_dict) = res_resolved.as_dict() else { return out };
+    let Ok(res_dict) = res_resolved.as_dict() else { return HashMap::new() };
+    codecs_from_resources(doc, res_dict)
+}
+
+/// Build codecs for every font in a resources dictionary (a page's, or a
+/// form XObject's own).
+fn codecs_from_resources(doc: &Document, res_dict: &Dictionary) -> HashMap<String, FontCodec> {
+    let mut out = HashMap::new();
     let Some(fonts_obj) = res_dict.get(b"Font").ok().cloned() else { return out };
     let fonts_resolved = resolve(doc, &fonts_obj).clone();
     let Ok(fonts) = fonts_resolved.as_dict() else { return out };
@@ -479,6 +633,9 @@ fn codec_for_font(doc: &Document, font: &Dictionary) -> FontCodec {
         // Composite font without a usable ToUnicode: display-only, 2-byte codes.
         return FontCodec { to_uni: HashMap::new(), from_uni: HashMap::new(), code_len: 2, invertible: false };
     }
+    // A Type3 font's codes mean nothing outside its own /Differences: there
+    // is no base encoding to fall back on.
+    let type3 = subtype == b"Type3";
 
     // Simple font. Honor /Encoding (a name, or a dict with /BaseEncoding and
     // /Differences). Symbolic fonts use their built-in encoding, which we
@@ -508,8 +665,9 @@ fn codec_for_font(doc: &Document, font: &Dictionary) -> FontCodec {
                 .and_then(named_table);
             let mut table = base.unwrap_or_else(|| {
                 // Without a BaseEncoding, the base is the font's built-in
-                // encoding: unknowable for symbolic fonts, ~WinAnsi otherwise.
-                if symbolic { [None; 256] } else { winansi_table() }
+                // encoding: unknowable for symbolic fonts, nonexistent for
+                // Type3, ~WinAnsi otherwise.
+                if symbolic || type3 { [None; 256] } else { winansi_table() }
             });
             if let Ok(Object::Array(diffs)) = enc.get(b"Differences").map(|o| resolve(doc, o)) {
                 let mut code = 0usize;
@@ -530,7 +688,7 @@ fn codec_for_font(doc: &Document, font: &Dictionary) -> FontCodec {
         }
         // No /Encoding at all: non-symbolic fonts are effectively WinAnsi in
         // the wild; symbolic ones get best-effort display but no edits.
-        _ => table_codec(&winansi_table(), !symbolic),
+        _ => table_codec(&winansi_table(), !symbolic && !type3),
     }
 }
 
@@ -542,27 +700,171 @@ fn num(o: &Object) -> Option<f32> {
     }
 }
 
-/// Extract text runs from one page (1-based).
+/// 2-D affine matrix in PDF's row-vector convention `[a b c d e f]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mat {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Mat {
+    const IDENTITY: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+
+    fn translate(tx: f32, ty: f32) -> Mat {
+        Mat { e: tx, f: ty, ..Mat::IDENTITY }
+    }
+
+    fn from_operands(ops: &[Object]) -> Option<Mat> {
+        if ops.len() < 6 {
+            return None;
+        }
+        Some(Mat {
+            a: num(&ops[0])?,
+            b: num(&ops[1])?,
+            c: num(&ops[2])?,
+            d: num(&ops[3])?,
+            e: num(&ops[4])?,
+            f: num(&ops[5])?,
+        })
+    }
+
+    /// `self` applied first, then `next` — PDF's `self × next`.
+    fn then(&self, next: &Mat) -> Mat {
+        Mat {
+            a: self.a * next.a + self.b * next.c,
+            b: self.a * next.b + self.b * next.d,
+            c: self.c * next.a + self.d * next.c,
+            d: self.c * next.b + self.d * next.d,
+            e: self.e * next.a + self.f * next.c + next.e,
+            f: self.e * next.b + self.f * next.d + next.f,
+        }
+    }
+
+    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+    }
+
+    /// Uniform scale factor (geometric mean of the axis scales).
+    fn scale(&self) -> f32 {
+        (self.a * self.d - self.b * self.c).abs().sqrt()
+    }
+}
+
+/// The graphics-state slice `q`/`Q` save and restore: CTM plus text state.
+#[derive(Clone)]
+struct GState {
+    ctm: Mat,
+    font_res: String,
+    font_size: f32,
+    char_sp: f32,
+    word_sp: f32,
+    h_scale: f32,
+    leading: f32,
+}
+
+impl Default for GState {
+    fn default() -> Self {
+        Self {
+            ctm: Mat::IDENTITY,
+            font_res: String::new(),
+            font_size: 0.0,
+            char_sp: 0.0,
+            word_sp: 0.0,
+            h_scale: 100.0,
+            leading: 0.0,
+        }
+    }
+}
+
+/// Fonts visible from a content stream: its own resources first, then the
+/// enclosing ones (a form XObject without /Resources inherits the page's).
+struct FontScope<'a> {
+    codecs: Vec<&'a HashMap<String, FontCodec>>,
+    widths: Vec<&'a HashMap<String, GlyphWidths>>,
+}
+
+impl FontScope<'_> {
+    fn codec(&self, name: &str) -> Option<&FontCodec> {
+        self.codecs.iter().find_map(|m| m.get(name))
+    }
+    fn widths(&self, name: &str) -> Option<&GlyphWidths> {
+        self.widths.iter().find_map(|m| m.get(name))
+    }
+}
+
+/// Extract text runs from one page (1-based), including text drawn through
+/// form XObjects (listed read-only).
 pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
     let pages = doc.get_pages();
     let &page_id = pages.get(&page_no).ok_or_else(|| anyhow!("page {page_no} out of range"))?;
     let content_bytes = doc.get_page_content(page_id);
     let content = Content::decode(&content_bytes).map_err(|e| anyhow!("couldn't parse page content: {e}"))?;
-    let codecs = page_font_codecs(doc, page_id);
-    let widths = page_font_widths(doc, page_id);
+    let res = resolve_inherited(doc, page_id, b"Resources")
+        .and_then(|o| resolve(doc, &o).as_dict().ok().cloned())
+        .unwrap_or_default();
+    let codecs = codecs_from_resources(doc, &res);
+    let widths = widths_from_resources(doc, &res);
+    let scope = FontScope { codecs: vec![&codecs], widths: vec![&widths] };
 
     let mut runs = Vec::new();
-    let mut font_res = String::new();
-    let mut font_size = 0.0f32;
-    // Tc / Tw / Tz — they scale run widths.
-    let (mut char_sp, mut word_sp, mut h_scale) = (0.0f32, 0.0f32, 100.0f32);
-    // text matrix origin (e,f) and line matrix origin
-    let mut tm = (0.0f32, 0.0f32);
-    let mut tlm = (0.0f32, 0.0f32);
-    let mut leading = 0.0f32;
+    let mut active: Vec<ObjectId> = Vec::new();
+    walk_content(doc, &content, &res, &scope, GState::default(), false, 0, &mut active, &mut runs);
+    Ok(runs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_run(
+    op_index: usize,
+    tj_item: Option<usize>,
+    gs: &GState,
+    tm: &Mat,
+    adv: Option<f32>,
+    text: String,
+    editable: bool,
+    in_form: bool,
+) -> TextRun {
+    let (x, y) = gs.ctm.apply(tm.e, tm.f);
+    let k = tm.scale() * gs.ctm.scale();
+    TextRun {
+        op_index,
+        tj_item,
+        font_res: gs.font_res.clone(),
+        font_size: gs.font_size,
+        display_size: gs.font_size * k,
+        x,
+        y,
+        width: adv.map(|w| w * k),
+        text,
+        editable: editable && !in_form,
+        in_form,
+    }
+}
+
+/// Walk one content stream, tracking `q`/`Q`/`cm`, the text and line
+/// matrices, and recursing into form XObjects on `Do`.
+#[allow(clippy::too_many_arguments)]
+fn walk_content(
+    doc: &Document,
+    content: &Content,
+    res: &Dictionary,
+    scope: &FontScope,
+    init: GState,
+    in_form: bool,
+    depth: u8,
+    active: &mut Vec<ObjectId>,
+    runs: &mut Vec<TextRun>,
+) {
+    let mut gs = init;
+    let mut stack: Vec<GState> = Vec::new();
+    let mut tm = Mat::IDENTITY;
+    let mut tlm = Mat::IDENTITY;
 
     let decode = |font: &str, bytes: &[u8]| -> (String, bool) {
-        match codecs.get(font) {
+        match scope.codec(font) {
             Some(c) => (c.decode(bytes), c.invertible),
             None => (String::from_utf8_lossy(bytes).into_owned(), false),
         }
@@ -570,52 +872,59 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
 
     for (op_index, op) in content.operations.iter().enumerate() {
         match op.operator.as_str() {
+            "q" => stack.push(gs.clone()),
+            "Q" => {
+                if let Some(g) = stack.pop() {
+                    gs = g;
+                }
+            }
+            "cm" => {
+                if let Some(m) = Mat::from_operands(&op.operands) {
+                    gs.ctm = m.then(&gs.ctm);
+                }
+            }
             "BT" => {
-                tm = (0.0, 0.0);
-                tlm = (0.0, 0.0);
+                tm = Mat::IDENTITY;
+                tlm = Mat::IDENTITY;
             }
             "Tf" => {
                 if let Some(Object::Name(n)) = op.operands.first() {
-                    font_res = String::from_utf8_lossy(n).into_owned();
+                    gs.font_res = String::from_utf8_lossy(n).into_owned();
                 }
                 if let Some(sz) = op.operands.get(1).and_then(num) {
-                    font_size = sz;
+                    gs.font_size = sz;
                 }
             }
             "Tm" => {
-                if op.operands.len() == 6 {
-                    let e = num(&op.operands[4]).unwrap_or(0.0);
-                    let f = num(&op.operands[5]).unwrap_or(0.0);
-                    tm = (e, f);
-                    tlm = (e, f);
+                if let Some(m) = Mat::from_operands(&op.operands) {
+                    tm = m;
+                    tlm = m;
                 }
             }
             "Td" | "TD" => {
                 let tx = op.operands.first().and_then(num).unwrap_or(0.0);
                 let ty = op.operands.get(1).and_then(num).unwrap_or(0.0);
                 if op.operator == "TD" {
-                    leading = -ty;
+                    gs.leading = -ty;
                 }
-                tlm = (tlm.0 + tx, tlm.1 + ty);
+                tlm = Mat::translate(tx, ty).then(&tlm);
                 tm = tlm;
             }
-            "TL" => {
-                leading = op.operands.first().and_then(num).unwrap_or(0.0);
-            }
-            "Tc" => char_sp = op.operands.first().and_then(num).unwrap_or(0.0),
-            "Tw" => word_sp = op.operands.first().and_then(num).unwrap_or(0.0),
-            "Tz" => h_scale = op.operands.first().and_then(num).unwrap_or(100.0),
+            "TL" => gs.leading = op.operands.first().and_then(num).unwrap_or(0.0),
+            "Tc" => gs.char_sp = op.operands.first().and_then(num).unwrap_or(0.0),
+            "Tw" => gs.word_sp = op.operands.first().and_then(num).unwrap_or(0.0),
+            "Tz" => gs.h_scale = op.operands.first().and_then(num).unwrap_or(100.0),
             "T*" => {
-                tlm = (tlm.0, tlm.1 - leading);
+                tlm = Mat::translate(0.0, -gs.leading).then(&tlm);
                 tm = tlm;
             }
             "Tj" | "'" | "\"" => {
                 if op.operator == "\"" {
-                    word_sp = op.operands.first().and_then(num).unwrap_or(word_sp);
-                    char_sp = op.operands.get(1).and_then(num).unwrap_or(char_sp);
+                    gs.word_sp = op.operands.first().and_then(num).unwrap_or(gs.word_sp);
+                    gs.char_sp = op.operands.get(1).and_then(num).unwrap_or(gs.char_sp);
                 }
                 if op.operator != "Tj" {
-                    tlm = (tlm.0, tlm.1 - leading);
+                    tlm = Mat::translate(0.0, -gs.leading).then(&tlm);
                     tm = tlm;
                 }
                 let string_operand = op.operands.iter().rev().find_map(|o| match o {
@@ -623,28 +932,28 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
                     _ => None,
                 });
                 if let Some(bytes) = string_operand {
-                    let st = AdvanceState { font_size, char_spacing: char_sp, word_spacing: word_sp, h_scale };
-                    let width = widths.get(&font_res).and_then(|gw| advance(gw, &bytes, &st));
-                    let (text, editable) = decode(&font_res, &bytes);
-                    runs.push(TextRun {
-                        op_index,
-                        tj_item: None,
-                        font_res: font_res.clone(),
-                        font_size,
-                        x: tm.0,
-                        y: tm.1,
-                        width,
-                        text,
-                        editable,
-                    });
-                    if let Some(w) = width {
-                        tm.0 += w;
+                    let st = AdvanceState {
+                        font_size: gs.font_size,
+                        char_spacing: gs.char_sp,
+                        word_spacing: gs.word_sp,
+                        h_scale: gs.h_scale,
+                    };
+                    let adv = scope.widths(&gs.font_res).and_then(|gw| advance(gw, &bytes, &st));
+                    let (text, editable) = decode(&gs.font_res, &bytes);
+                    runs.push(make_run(op_index, None, &gs, &tm, adv, text, editable, in_form));
+                    if let Some(w) = adv {
+                        tm = Mat::translate(w, 0.0).then(&tm);
                     }
                 }
             }
             "TJ" => {
                 if let Some(Object::Array(items)) = op.operands.first() {
-                    let st = AdvanceState { font_size, char_spacing: char_sp, word_spacing: word_sp, h_scale };
+                    let st = AdvanceState {
+                        font_size: gs.font_size,
+                        char_spacing: gs.char_sp,
+                        word_spacing: gs.word_sp,
+                        h_scale: gs.h_scale,
+                    };
                     // Track the advance across items so each string gets its
                     // real start x; falls back to the TJ's start when a width
                     // is unknowable.
@@ -652,20 +961,11 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
                     for (tj_item, item) in items.iter().enumerate() {
                         match item {
                             Object::String(bytes, _) => {
-                                let width = widths.get(&font_res).and_then(|gw| advance(gw, bytes, &st));
-                                let (text, editable) = decode(&font_res, bytes);
-                                runs.push(TextRun {
-                                    op_index,
-                                    tj_item: Some(tj_item),
-                                    font_res: font_res.clone(),
-                                    font_size,
-                                    x: tm.0 + acc.unwrap_or(0.0),
-                                    y: tm.1,
-                                    width,
-                                    text,
-                                    editable,
-                                });
-                                acc = match (acc, width) {
+                                let adv = scope.widths(&gs.font_res).and_then(|gw| advance(gw, bytes, &st));
+                                let (text, editable) = decode(&gs.font_res, bytes);
+                                let here = Mat::translate(acc.unwrap_or(0.0), 0.0).then(&tm);
+                                runs.push(make_run(op_index, Some(tj_item), &gs, &here, adv, text, editable, in_form));
+                                acc = match (acc, adv) {
                                     (Some(a), Some(w)) => Some(a + w),
                                     _ => None,
                                 };
@@ -678,14 +978,71 @@ pub fn text_runs(doc: &Document, page_no: u32) -> Result<Vec<TextRun>> {
                         }
                     }
                     if let Some(a) = acc {
-                        tm.0 += a;
+                        tm = Mat::translate(a, 0.0).then(&tm);
                     }
+                }
+            }
+            "Do" => {
+                if depth >= 8 {
+                    continue;
+                }
+                let Some(Object::Name(name)) = op.operands.first() else { continue };
+                let Some(xobjs) = res.get(b"XObject").ok().map(|o| resolve(doc, o)).and_then(|o| o.as_dict().ok()) else {
+                    continue;
+                };
+                let Ok(entry) = xobjs.get(name) else { continue };
+                let id = entry.as_reference().ok();
+                if id.is_some_and(|id| active.contains(&id)) {
+                    continue; // a form that draws itself — never recurse
+                }
+                let Object::Stream(form) = resolve(doc, entry) else { continue };
+                if form.dict.get(b"Subtype").ok().and_then(|s| s.as_name().ok()) != Some(b"Form") {
+                    continue;
+                }
+                let Ok(data) = form.decompressed_content() else { continue };
+                let Ok(inner) = Content::decode(&data) else { continue };
+                let matrix = form
+                    .dict
+                    .get(b"Matrix")
+                    .ok()
+                    .map(|o| resolve(doc, o))
+                    .and_then(|o| o.as_array().ok())
+                    .and_then(|a| Mat::from_operands(a))
+                    .unwrap_or(Mat::IDENTITY);
+                let form_res = form
+                    .dict
+                    .get(b"Resources")
+                    .ok()
+                    .map(|o| resolve(doc, o))
+                    .and_then(|o| o.as_dict().ok())
+                    .cloned();
+                // `Do` runs the form inside an implicit q…Q with its /Matrix
+                // prepended to the CTM; the text state is inherited.
+                let mut inner_gs = gs.clone();
+                inner_gs.ctm = matrix.then(&gs.ctm);
+                if let Some(id) = id {
+                    active.push(id);
+                }
+                match form_res {
+                    Some(fr) => {
+                        let codecs = codecs_from_resources(doc, &fr);
+                        let widths = widths_from_resources(doc, &fr);
+                        let mut c = vec![&codecs];
+                        c.extend(scope.codecs.iter().copied());
+                        let mut w = vec![&widths];
+                        w.extend(scope.widths.iter().copied());
+                        let inner_scope = FontScope { codecs: c, widths: w };
+                        walk_content(doc, &inner, &fr, &inner_scope, inner_gs, true, depth + 1, active, runs);
+                    }
+                    None => walk_content(doc, &inner, res, scope, inner_gs, true, depth + 1, active, runs),
+                }
+                if id.is_some() {
+                    active.pop();
                 }
             }
             _ => {}
         }
     }
-    Ok(runs)
 }
 
 /// What an edit did beyond changing the string.
@@ -710,6 +1067,11 @@ pub struct EditOutcome {
 /// `fonts`); the returned [`EditOutcome`] says so.
 /// Content-stream op indices may change — re-list runs after every edit.
 pub fn edit_run(doc: &mut Document, page_no: u32, run: &TextRun, new_text: &str) -> Result<EditOutcome> {
+    if run.in_form {
+        return Err(anyhow!(
+            "this text is drawn through a form XObject — editing it in place isn't supported yet"
+        ));
+    }
     let pages = doc.get_pages();
     let &page_id = pages.get(&page_no).ok_or_else(|| anyhow!("page {page_no} out of range"))?;
     let codecs = page_font_codecs(doc, page_id);
@@ -1344,9 +1706,14 @@ fn reflow_line(
     }
 }
 
-/// Find & replace across a page's editable runs. Returns replacement count.
+/// Find & replace across a page's editable runs. Returns the number of
+/// occurrences replaced (a run holding `find` twice counts twice).
 pub fn find_replace(doc: &mut Document, page_no: u32, find: &str, replace: &str) -> Result<u32> {
-    let mut count = 0;
+    if find.is_empty() {
+        return Err(anyhow!("nothing to find — the search text is empty"));
+    }
+    let mut count = 0u32;
+    let mut edits = 0u32;
     // Re-list runs after each edit: op indices stay stable because we patch
     // strings in place, but be defensive anyway.
     loop {
@@ -1354,10 +1721,12 @@ pub fn find_replace(doc: &mut Document, page_no: u32, find: &str, replace: &str)
         let Some(hit) = runs.iter().find(|r| r.editable && r.text.contains(find)) else {
             break;
         };
+        let occurrences = hit.text.matches(find).count() as u32;
         let new_text = hit.text.replace(find, replace);
         edit_run(doc, page_no, hit, &new_text)?;
-        count += 1;
-        if count > 10_000 {
+        count += occurrences.max(1);
+        edits += 1;
+        if edits > 10_000 {
             return Err(anyhow!("replacement loop runaway — aborting"));
         }
     }
@@ -1781,5 +2150,133 @@ mod tests {
         let after = text_runs(&doc, 1).unwrap();
         assert_eq!(after[0].text, "ABAB", "edit itself must still land");
         assert!((after[1].x - 110.0).abs() < 0.01, "no metrics -> no shift, got x={}", after[1].x);
+    }
+
+    #[test]
+    fn tounicode_bfrange_array_form_parses() {
+        let cmap: &[u8] = b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+            1 beginbfrange\n<41> <43> [<0058> <0059> <005A>]\n<61> <62> <0061>\nendbfrange\n\
+            1 beginbfchar\n<44> <0044>\n<45> /Euro\nendbfchar\n\
+            endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend";
+        let codec = tounicode_codec(cmap).expect("cmap parses");
+        assert_eq!(codec.code_len, 1);
+        assert_eq!(codec.decode(b"ABCDab"), "XYZDab", "array-form bfrange must map each code to its own entry");
+        assert!(codec.invertible);
+        assert_eq!(codec.encode("XYZ"), Some(b"ABC".to_vec()));
+
+        // Through a font on a page, with the CMap as the font's ToUnicode.
+        use lopdf::{dictionary, Stream};
+        let font = dictionary! {
+            "Type" => "Font", "Subtype" => "TrueType", "BaseFont" => "Custom",
+            "ToUnicode" => Object::Stream(Stream::new(dictionary! {}, cmap.to_vec())),
+        };
+        let doc = one_page_doc(font, b"BT /F1 12 Tf 50 700 Td (ABC) Tj ET");
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs[0].text, "XYZ");
+    }
+
+    #[test]
+    fn two_byte_bfrange_array_form_keeps_code_width() {
+        let cmap: &[u8] = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+            1 beginbfrange <0010> <0011> [<0041> <0042>] endbfrange";
+        let codec = tounicode_codec(cmap).unwrap();
+        assert_eq!(codec.code_len, 2);
+        assert_eq!(codec.decode(&[0x00, 0x10, 0x00, 0x11]), "AB");
+    }
+
+    #[test]
+    fn runs_honor_cm_and_scaled_tm() {
+        let content: &[u8] = b"q 1 0 0 1 100 50 cm BT /F1 1 Tf 12 0 0 12 20 30 Tm (AB) Tj ET Q \
+                               BT /F1 12 Tf 50 700 Td (CD) Tj ET";
+        let doc = one_page_doc(helv(), content);
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs.len(), 2);
+        // Tm scale 12 × Tf 1 at (20,30), shifted by the cm (100,50).
+        assert!((runs[0].x - 120.0).abs() < 0.01 && (runs[0].y - 80.0).abs() < 0.01, "got ({},{})", runs[0].x, runs[0].y);
+        assert!((runs[0].display_size - 12.0).abs() < 0.01, "got {}", runs[0].display_size);
+        assert!((runs[0].font_size - 1.0).abs() < 0.01, "nominal Tf size must stay");
+        assert!((runs[0].width.unwrap() - helv_w("AB", 12.0)).abs() < 0.01, "user-space width includes the Tm scale");
+        // After Q the cm is gone.
+        assert!((runs[1].x - 50.0).abs() < 0.01 && (runs[1].y - 700.0).abs() < 0.01);
+        assert!((runs[1].display_size - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_inside_form_xobjects_is_listed_read_only() {
+        use lopdf::{dictionary, Stream};
+        let mut doc = one_page_doc(helv(), b"BT /F1 12 Tf 50 700 Td (Page) Tj ET q 1 0 0 1 200 100 cm /Fx Do Q");
+        let page_id = doc.get_pages()[&1];
+        let font_ref = {
+            let page = doc.get_dictionary(page_id).unwrap();
+            let res = page.get(b"Resources").unwrap().as_dict().unwrap();
+            res.get(b"Font").unwrap().as_dict().unwrap().get(b"F1").unwrap().clone()
+        };
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+                "Matrix" => vec![1.into(), 0.into(), 0.into(), 1.into(), 10.into(), 20.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_ref } },
+            },
+            b"BT /F1 10 Tf 5 5 Td (Inside) Tj ET".to_vec(),
+        ));
+        {
+            let page = doc.get_dictionary_mut(page_id).unwrap();
+            let mut res = page.get(b"Resources").unwrap().as_dict().unwrap().clone();
+            res.set("XObject", dictionary! { "Fx" => Object::Reference(form) });
+            page.set("Resources", Object::Dictionary(res));
+        }
+        let runs = text_runs(&doc, 1).unwrap();
+        let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["Page", "Inside"]);
+        let inside = runs[1].clone();
+        assert!(inside.in_form && !inside.editable);
+        assert!(!runs[0].in_form && runs[0].editable);
+        // (5,5) in form space → +Matrix (10,20) → +cm (200,100).
+        assert!((inside.x - 215.0).abs() < 0.01 && (inside.y - 125.0).abs() < 0.01, "got ({},{})", inside.x, inside.y);
+        assert!(edit_run(&mut doc, 1, &inside, "Nope").is_err(), "form text must refuse in-place edits");
+        // find_replace skips it without error and still edits page-level text.
+        assert_eq!(find_replace(&mut doc, 1, "Inside", "Out").unwrap(), 0);
+        assert_eq!(find_replace(&mut doc, 1, "Page", "Sheet").unwrap(), 1);
+        assert!(text_runs(&doc, 1).unwrap().iter().any(|r| r.text == "Sheet"));
+    }
+
+    #[test]
+    fn find_replace_counts_every_occurrence() {
+        let mut doc = one_page_doc(helv(), b"BT /F1 12 Tf 50 700 Td (ab ab ab) Tj ET");
+        assert_eq!(find_replace(&mut doc, 1, "ab", "x").unwrap(), 3);
+        assert_eq!(text_runs(&doc, 1).unwrap()[0].text, "x x x");
+        assert!(find_replace(&mut doc, 1, "", "x").is_err());
+    }
+
+    #[test]
+    fn type3_fonts_measure_through_their_font_matrix() {
+        use lopdf::dictionary;
+        // Glyph space is 1/100 text space; 'a' is 50 glyph units wide → 0.5 em.
+        let font = dictionary! {
+            "Type" => "Font", "Subtype" => "Type3",
+            "FontMatrix" => vec![Object::Real(0.01), 0.into(), 0.into(), Object::Real(0.01), 0.into(), 0.into()],
+            "FontBBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+            "CharProcs" => dictionary! {},
+            "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => vec![97.into(), Object::Name(b"a".to_vec())] },
+            "FirstChar" => 97, "LastChar" => 97, "Widths" => vec![50.into()],
+        };
+        let doc = one_page_doc(font, b"BT /F1 20 Tf 50 700 Td (aa) Tj ET");
+        let runs = text_runs(&doc, 1).unwrap();
+        assert_eq!(runs[0].text, "aa");
+        assert!((runs[0].width.unwrap() - 20.0).abs() < 0.01, "2 × 0.5em × 20pt = 20, got {:?}", runs[0].width);
+        // Codes outside /Differences decode as unknown rather than as WinAnsi.
+        let doc2 = one_page_doc(
+            dictionary! {
+                "Type" => "Font", "Subtype" => "Type3",
+                "FontMatrix" => vec![Object::Real(0.01), 0.into(), 0.into(), Object::Real(0.01), 0.into(), 0.into()],
+                "Encoding" => dictionary! { "Differences" => vec![97.into(), Object::Name(b"a".to_vec())] },
+            },
+            b"BT /F1 20 Tf 50 700 Td (ab) Tj ET",
+        );
+        assert_eq!(text_runs(&doc2, 1).unwrap()[0].text, "a\u{FFFD}");
     }
 }

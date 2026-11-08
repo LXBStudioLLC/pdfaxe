@@ -229,7 +229,10 @@ pub(crate) struct SystemFonts {
 }
 
 fn walk(dir: &Path, depth: u8, out: &mut Vec<FaceInfo>) {
-    if depth > 3 {
+    // Font managers nest installs a few levels deep (vendor/family/style);
+    // six levels covers every layout seen in the wild without crawling the
+    // whole disk if someone points a font directory at a root.
+    if depth > 6 {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
