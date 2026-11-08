@@ -14,7 +14,7 @@ Architecturally incapable of seeing your files.</p>
 
 <p align="center">
   <a href="https://github.com/LXBStudioLLC/pdfaxe/actions/workflows/ci.yml"><img src="https://github.com/LXBStudioLLC/pdfaxe/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/release-imminent-e5311b" alt="Release imminent">
+  <a href="https://github.com/LXBStudioLLC/pdfaxe/releases/latest"><img src="https://img.shields.io/github/v/release/LXBStudioLLC/pdfaxe?color=e5311b&label=release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/rust-100%25%20%C2%B7%20zero%20FFI-b7410e" alt="100% Rust, zero FFI">
   <img src="https://img.shields.io/badge/license-AGPL--3.0-e5311b" alt="AGPL-3.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-17171a" alt="Windows 10/11 x64">
